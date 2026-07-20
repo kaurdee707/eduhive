@@ -33,15 +33,97 @@ async function upsertDB(table, body) {
   if (!res.ok) { let m; try { m = JSON.parse(text).message; } catch { m = text; } throw new Error(m); }
   return text ? JSON.parse(text) : null;
 }
+async function saveAnswer(studentId, assignmentId, questionId, selectedAnswer, isCorrect = null) {
+  const url = `${SB_URL}/rest/v1/student_answers?on_conflict=student_id,question_id`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      apikey: SB_KEY, Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation,resolution=merge-duplicates"
+    },
+    body: JSON.stringify({
+      student_id: studentId, assignment_id: assignmentId,
+      question_id: questionId, selected_answer: selectedAnswer,
+      is_correct: isCorrect, saved_at: new Date().toISOString()
+    })
+  });
+  if (!res.ok) { const t = await res.text(); let m; try { m = JSON.parse(t).message; } catch { m = t; } throw new Error(m); }
+  return res.json();
+}
+async function saveSubmission(studentId, assignmentId, data) {
+  const url = `${SB_URL}/rest/v1/submissions?on_conflict=student_id,assignment_id`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      apikey: SB_KEY, Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation,resolution=merge-duplicates"
+    },
+    body: JSON.stringify({ student_id: studentId, assignment_id: assignmentId, ...data })
+  });
+  if (!res.ok) { const t = await res.text(); let m; try { m = JSON.parse(t).message; } catch { m = t; } throw new Error(m); }
+  return res.json();
+}
+async function uploadFile(file, userId, assignmentId) {
+  const ext = file.name.split(".").pop();
+  const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const path = `${userId}/${assignmentId}/${safeName}`;
+  const res = await fetch(`${SB_URL}/storage/v1/object/assignments/${path}`, {
+    method: "POST",
+    headers: {
+      apikey: SB_KEY,
+      Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": file.type || "application/octet-stream",
+      "x-upsert": "true"
+    },
+    body: file
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error("File upload failed: " + t);
+  }
+  // Return the public URL
+  return `${SB_URL}/storage/v1/object/public/assignments/${path}`;
+}
+
 
 async function sbSignUp(email, password, name) {
-  const res = await fetch(`${SB_URL}/auth/v1/signup`, { method: "POST", headers: { apikey: SB_KEY, "Content-Type": "application/json" }, body: JSON.stringify({ email, password, data: { name } }) });
-  return res.json();
+  const r = await fetch(`${SB_URL}/auth/v1/signup`, {
+    method: "POST",
+    headers: { apikey: SB_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password, data: { name } })
+  });
+  const data = await r.json();
+  return { ...data, _ok: r.ok, _status: r.status };
 }
+function getAuthError(res) {
+  // Handles both old format {error, error_description}
+  // and new GoTrue v2 format {msg, error_code, code}
+  return (
+    res.msg ||
+    res.error_description ||
+    res.message ||
+    res.error?.message ||
+    (typeof res.error === "string" ? res.error : null) ||
+    `Auth error (status ${res._status || "?"})`
+  );
+}
+
+
+
 async function sbSignIn(email, password) {
-  const res = await fetch(`${SB_URL}/auth/v1/token?grant_type=password`, { method: "POST", headers: { apikey: SB_KEY, "Content-Type": "application/json" }, body: JSON.stringify({ email, password }) });
-  return res.json();
+  const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=password`, {
+    method: "POST",
+    headers: { apikey: SB_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password })
+  });
+  const data = await r.json();
+  // Attach HTTP status so callers can detect errors reliably
+  // regardless of which Supabase error format is returned
+  return { ...data, _ok: r.ok, _status: r.status };
 }
+
 async function sbSignOut() {
   await fetch(`${SB_URL}/auth/v1/logout`, { method: "POST", headers: { apikey: SB_KEY, Authorization: `Bearer ${TOKEN}` } });
 }
@@ -207,11 +289,30 @@ function InviteSetupScreen({ token, onLogin }) {
     if (pass !== pass2) { setError("Passwords don't match."); return; }
     setSaving(true); setError("");
     try {
-      // Use auth_email if available (new system), fall back to real email (old system)
       const signupEmail = studentInfo.auth_email || studentInfo.email;
-      if (!signupEmail) throw new Error("No email found for this account. Ask your teacher to resend the invite.");
+      if (!signupEmail) throw new Error("No login email found. Ask your teacher to resend the invite link.");
+
       const res = await sbSignUp(signupEmail, pass, studentInfo.student_name);
-      if (res.error) throw new Error(res.error.message);
+
+      if (!res._ok) {
+        // If account already exists, try signing in instead
+        if (res._status === 400 && (res.msg || "").toLowerCase().includes("already")) {
+          const signIn = await sbSignIn(signupEmail, pass);
+          if (!signIn._ok) throw new Error("Account already exists. Try logging in directly.");
+          TOKEN = signIn.access_token;
+          const data = await loadStudentData(signIn.user.id);
+          onLogin({ type: "student", session: signIn, data });
+          window.history.replaceState({}, "", window.location.pathname);
+          return;
+        }
+        throw new Error(getAuthError(res));
+      }
+
+      if (!res.access_token) {
+        setError("Please check your email to confirm your account, then log in with your username and password.");
+        return;
+      }
+
       TOKEN = res.access_token;
       const data = await loadStudentData(res.user.id);
       onLogin({ type: "student", session: res, data });
@@ -219,6 +320,7 @@ function InviteSetupScreen({ token, onLogin }) {
     } catch (e) { setError(e.message); }
     finally { setSaving(false); }
   };
+
 
   if (loading) return (
     <div style={{ minHeight: "100vh", background: "linear-gradient(135deg,#0F172A,#1E1B4B)", display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -272,15 +374,20 @@ function AuthScreen({ onLogin }) {
     try {
       if (tab === "signup") {
         const res = await sbSignUp(email, pass, name);
-        if (res.error) throw new Error(res.error.message);
-        if (!res.access_token) { setError("Check your email to confirm, or disable email confirmation in Supabase Auth settings."); return; }
+        if (!res._ok) { setError(getAuthError(res)); return; }
+        if (!res.access_token) {
+          setError("Check your email to confirm your account, then log in.");
+          return;
+        }
         TOKEN = res.access_token;
         const data = await loadTeacherData(res.user.id);
         onLogin({ type: "teacher", session: res, data });
       } else {
         const res = await sbSignIn(email, pass);
-        if (res.error) throw new Error(res.error.message);
+        if (!res._ok) { throw new Error(getAuthError(res)); }
+        if (!res.user?.id) throw new Error("Login failed — please try again.");
         TOKEN = res.access_token;
+        // Check if this person is a student
         const studentAccts = await db("student_accounts", "GET", `auth_user_id=eq.${res.user.id}`);
         if (studentAccts?.length) {
           const data = await loadStudentData(res.user.id);
@@ -294,26 +401,57 @@ function AuthScreen({ onLogin }) {
     finally { setLoading(false); }
   };
 
-  const handleStudent = async () => {
+
+
+   const handleStudent = async () => {
     if (!username.trim()) { setError("Please enter your username."); return; }
     if (!pass.trim()) { setError("Please enter your password."); return; }
     setLoading(true); setError("");
     try {
       // Look up student account by username
       const accts = await db("student_accounts", "GET", `username=eq.${username.trim().toLowerCase()}`);
-      if (!accts?.length) throw new Error("No student found with that username. Check with your teacher.");
+      if (!accts?.length) {
+        throw new Error(`No student found with username "${username.trim()}". Check with your teacher.`);
+      }
       const acct = accts[0];
-      // Use auth_email (new system) or fall back to email (old system)
-      const loginEmail = acct.auth_email || acct.email;
-      if (!loginEmail) throw new Error("Account not set up yet. Ask your teacher to send a new invite link.");
-      const res = await sbSignIn(loginEmail, pass);
-      if (res.error) throw new Error(res.error.message || "Incorrect password.");
+
+      // Try auth_email first (new system), then fall back to real email (old system)
+      const primaryEmail = acct.auth_email;
+      const fallbackEmail = acct.email;
+
+      let res = null;
+
+      // Attempt 1: auth_email (new invite system)
+      if (primaryEmail) {
+        res = await sbSignIn(primaryEmail, pass);
+      }
+
+      // Attempt 2: if first failed or no auth_email, try real email
+      if ((!res || !res._ok) && fallbackEmail && fallbackEmail !== primaryEmail) {
+        res = await sbSignIn(fallbackEmail, pass);
+      }
+
+      if (!res) {
+        throw new Error("No login email found for this account. Ask your teacher to resend the invite link.");
+      }
+
+      if (!res._ok) {
+        throw new Error("Incorrect password. Please try again.");
+      }
+
+      if (!res.user?.id) {
+        throw new Error("Login failed — unexpected response. Please try again.");
+      }
+
       TOKEN = res.access_token;
       const data = await loadStudentData(res.user.id);
       onLogin({ type: "student", session: res, data });
+
     } catch (e) { setError(e.message); }
     finally { setLoading(false); }
   };
+
+
 
   return (
     <div style={{ minHeight: "100vh", background: "linear-gradient(135deg,#0F172A 0%,#1E1B4B 100%)", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Inter','Outfit',sans-serif" }}>
@@ -808,124 +946,436 @@ function QuestionBuilder({ questions, setQuestions }) {
 // ── Add Assignment Modal ──────────────────────────────────────────────────────
 function AddAssignmentModal({ classes, students, reload, userId, data, close }) {
   const [step, setStep] = useState(1);
-  const [title, setTitle] = useState(""); const [subject, setSubject] = useState(SUBJECTS[0]);
+  const [title, setTitle] = useState("");
+  const [subject, setSubject] = useState(SUBJECTS[0]);
   const [classId, setClassId] = useState(data.classId || classes[0]?.id || "");
-  const [dueDate, setDueDate] = useState(""); const [desc, setDesc] = useState("");
-  const [fileName, setFileName] = useState(null); const [assignedTo, setAssignedTo] = useState([]);
+  const [dueDate, setDueDate] = useState("");
+  const [desc, setDesc] = useState("");
+  const [file, setFile] = useState(null);          // actual File object
+  const [fileName, setFileName] = useState(null);   // display name
+  const [assignedTo, setAssignedTo] = useState([]);
   const [questions, setQuestions] = useState([]);
-  const [loading, setLoading] = useState(false); const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState("");
+  const [err, setErr] = useState("");
   const fileRef = useRef();
+
   const selClass = classes.find(c => c.id === classId);
   const classStudents = students.filter(s => selClass?.students.includes(s.id));
+
+  const handleFile = (e) => {
+    const f = e.target.files[0];
+    if (f) { setFile(f); setFileName(f.name); }
+  };
+
   const save = async () => {
     if (!title.trim() || !classId) { setErr("Title and class are required."); return; }
-    setLoading(true); setErr("");
+    setLoading(true); setErr(""); setUploadProgress("");
     try {
-      const [newA] = await db("assignments", "POST", "", { teacher_id: userId, class_id: classId, subject, title: title.trim(), description: desc, due_date: dueDate || null, file_name: fileName, status: "active" });
+      // 1. Create assignment record
+      setUploadProgress("Creating assignment…");
+      const [newA] = await db("assignments", "POST", "", {
+        teacher_id: userId, class_id: classId, subject,
+        title: title.trim(), description: desc,
+        due_date: dueDate || null,
+        file_name: fileName || null,
+        status: "active"
+      });
+
+      // 2. Upload file if one was selected
+      let fileUrl = null;
+      if (file && newA.id) {
+        setUploadProgress("Uploading file… please wait");
+        try {
+          fileUrl = await uploadFile(file, userId, newA.id);
+          // Update assignment with file URL
+          await db("assignments", "PATCH", `id=eq.${newA.id}`, { file_url: fileUrl });
+        } catch (uploadErr) {
+          // Don't fail the whole assignment if upload fails — just warn
+          console.error("File upload failed:", uploadErr);
+          setErr("Assignment saved but file upload failed: " + uploadErr.message);
+        }
+      }
+
+      // 3. Assign to students
+      setUploadProgress("Assigning to students…");
       const targets = assignedTo.length ? assignedTo : classStudents.map(s => s.id);
-      await Promise.all([
-        ...targets.map(sid => db("assignment_students", "POST", "", { assignment_id: newA.id, student_id: sid })),
-        ...questions.filter(q => q.text.trim() && q.correct).map((q, i) => db("questions", "POST", "", { assignment_id: newA.id, question_text: q.text, question_type: q.type, options: q.type === "multiple_choice" ? q.options : null, correct_answer: q.correct, explanation: q.explanation || null, points: 1, order_index: i }))
-      ]);
-      await reload(); close();
-    } catch (e) { setErr(e.message); } finally { setLoading(false); }
+      await Promise.all(targets.map(sid =>
+        db("assignment_students", "POST", "", { assignment_id: newA.id, student_id: sid })
+      ));
+
+      // 4. Save questions
+      const validQuestions = questions.filter(q => q.text.trim() && q.correct);
+      if (validQuestions.length > 0) {
+        setUploadProgress("Saving questions…");
+        await Promise.all(validQuestions.map((q, i) =>
+          db("questions", "POST", "", {
+            assignment_id: newA.id, question_text: q.text,
+            question_type: q.type,
+            options: q.type === "multiple_choice" ? q.options : null,
+            correct_answer: q.correct,
+            explanation: q.explanation || null,
+            points: 1, order_index: i
+          })
+        ));
+      }
+
+      await reload();
+      close();
+    } catch (e) { setErr(e.message); }
+    finally { setLoading(false); setUploadProgress(""); }
   };
-  return (<div>
-    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-      <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 22, fontWeight: 800, color: "#0F172A" }}>{step === 1 ? "New Assignment" : "Question Builder"}</div>
-      <div style={{ display: "flex", gap: 6 }}>
-        <button onClick={() => setStep(1)} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: 600, background: step === 1 ? "#4F46E5" : "#F1F5F9", color: step === 1 ? "#fff" : "#475569" }}>① Details</button>
-        <button onClick={() => setStep(2)} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: 600, background: step === 2 ? "#4F46E5" : "#F1F5F9", color: step === 2 ? "#fff" : "#475569" }}>② Questions {questions.length > 0 && `(${questions.length})`}</button>
-      </div>
-    </div>
-    {err && <div className="err">{err}</div>}
-    {step === 1 && <>
-      <div style={{ marginBottom: 16 }}><label className="lbl">Title</label><input className="inp" placeholder="e.g. Geometry Practice Test 1" value={title} onChange={e => setTitle(e.target.value)} /></div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
-        <div><label className="lbl">Class</label><select className="sel" value={classId} onChange={e => { setClassId(e.target.value); setAssignedTo([]); }}>{classes.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
-        <div><label className="lbl">Subject</label><select className="sel" value={subject} onChange={e => setSubject(e.target.value)}>{(selClass?.subjects.length ? selClass.subjects : SUBJECTS).map(s => <option key={s}>{s}</option>)}</select></div>
-      </div>
-      <div style={{ marginBottom: 16 }}><label className="lbl">Due Date</label><input className="inp" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} /></div>
-      <div style={{ marginBottom: 16 }}><label className="lbl">Instructions</label><textarea className="inp" rows={2} placeholder="Describe the assignment…" value={desc} onChange={e => setDesc(e.target.value)} style={{ resize: "vertical" }} /></div>
-      <div style={{ marginBottom: 16 }}><label className="lbl">Attach File (optional)</label>
-        <div onClick={() => fileRef.current.click()} style={{ border: "2px dashed #C7D2FE", borderRadius: 12, padding: 20, textAlign: "center", cursor: "pointer", background: "#F5F3FF" }}>
-          {fileName ? <div><div style={{ fontSize: 20 }}>📄</div><div style={{ fontWeight: 600, color: "#4F46E5", marginTop: 4, fontSize: 13 }}>{fileName}</div></div> : <div><div style={{ fontSize: 24 }}>📁</div><div style={{ fontWeight: 600, color: "#4F46E5", marginTop: 6, fontSize: 13 }}>Click to attach file</div></div>}
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+        <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 22, fontWeight: 800, color: "#0F172A" }}>
+          {step === 1 ? "New Assignment" : "Question Builder"}
         </div>
-        <input ref={fileRef} type="file" style={{ display: "none" }} onChange={e => setFileName(e.target.files[0]?.name || null)} />
+        <div style={{ display: "flex", gap: 6 }}>
+          {[{ n: 1, label: "① Details" }, { n: 2, label: `② Questions${questions.length > 0 ? ` (${questions.length})` : ""}` }].map(t => (
+            <button key={t.n} onClick={() => setStep(t.n)} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: 600, background: step === t.n ? "#4F46E5" : "#F1F5F9", color: step === t.n ? "#fff" : "#475569" }}>
+              {t.label}
+            </button>
+          ))}
+        </div>
       </div>
-      {classStudents.length > 0 && <div style={{ marginBottom: 16 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}><label className="lbl" style={{ margin: 0 }}>Assign To</label><button style={{ fontSize: 12, color: "#4F46E5", background: "none", border: "none", cursor: "pointer", fontWeight: 600 }} onClick={() => setAssignedTo(classStudents.map(s => s.id))}>Select All</button></div>
-        <div style={{ maxHeight: 130, overflowY: "auto", background: "#F8FAFF", borderRadius: 10, padding: 8 }}>{classStudents.map(s => <label key={s.id} className="ckl"><input type="checkbox" checked={assignedTo.includes(s.id)} onChange={() => setAssignedTo(p => p.includes(s.id) ? p.filter(x => x !== s.id) : [...p, s.id])} style={{ accentColor: "#4F46E5" }} /><div className="av" style={{ background: getAC(s.id), width: 28, height: 28, fontSize: 10 }}>{s.avatar || s.name[0]}</div><span style={{ fontSize: 13, fontWeight: 500, color: "#0F172A" }}>{s.name}</span></label>)}</div>
-        {assignedTo.length === 0 && <div style={{ fontSize: 11, color: "#94A3B8", marginTop: 4 }}>No selection = assign to all students</div>}
-      </div>}
-      <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-        <button className="btn2" onClick={close}>Cancel</button>
-        <button className="btn2" onClick={() => setStep(2)}>Next: Questions →</button>
-        <button className="btn1" onClick={save} disabled={loading}>{loading ? "Saving…" : "Save Assignment"}</button>
-      </div>
-    </>}
-    {step === 2 && <>
-      <QuestionBuilder questions={questions} setQuestions={setQuestions} />
-      <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 16 }}>
-        <button className="btn2" onClick={() => setStep(1)}>← Back</button>
-        <button className="btn1" onClick={save} disabled={loading}>{loading ? "Saving…" : `Save (${questions.length} questions)`}</button>
-      </div>
-    </>}
-  </div>);
+
+      {err && <div className="err">{err}</div>}
+      {uploadProgress && (
+        <div style={{ background: "#EEF2FF", color: "#4F46E5", padding: "10px 14px", borderRadius: 10, marginBottom: 12, fontSize: 13, fontWeight: 500 }}>
+          ⏳ {uploadProgress}
+        </div>
+      )}
+
+      {step === 1 && <>
+        <div style={{ marginBottom: 16 }}>
+          <label className="lbl">Title</label>
+          <input className="inp" placeholder="e.g. Geometry Practice Test 1" value={title} onChange={e => setTitle(e.target.value)} />
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
+          <div>
+            <label className="lbl">Class</label>
+            <select className="sel" value={classId} onChange={e => { setClassId(e.target.value); setAssignedTo([]); }}>
+              {classes.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="lbl">Subject</label>
+            <select className="sel" value={subject} onChange={e => setSubject(e.target.value)}>
+              {(selClass?.subjects.length ? selClass.subjects : SUBJECTS).map(s => <option key={s}>{s}</option>)}
+            </select>
+          </div>
+        </div>
+        <div style={{ marginBottom: 16 }}>
+          <label className="lbl">Due Date</label>
+          <input className="inp" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} />
+        </div>
+        <div style={{ marginBottom: 16 }}>
+          <label className="lbl">Instructions</label>
+          <textarea className="inp" rows={2} placeholder="Describe the assignment…" value={desc} onChange={e => setDesc(e.target.value)} style={{ resize: "vertical" }} />
+        </div>
+
+        {/* File Upload */}
+        <div style={{ marginBottom: 16 }}>
+          <label className="lbl">Attach File <span style={{ color: "#94A3B8", fontWeight: 400, textTransform: "none" }}>(optional — PDF, DOCX, images, etc.)</span></label>
+          <div
+            onClick={() => fileRef.current.click()}
+            style={{ border: `2px dashed ${file ? "#4F46E5" : "#C7D2FE"}`, borderRadius: 12, padding: 20, textAlign: "center", cursor: "pointer", background: file ? "#EEF2FF" : "#F5F3FF", transition: "all 0.18s" }}
+          >
+            {file ? (
+              <div>
+                <div style={{ fontSize: 28, marginBottom: 4 }}>📄</div>
+                <div style={{ fontWeight: 600, color: "#4F46E5", fontSize: 14 }}>{file.name}</div>
+                <div style={{ color: "#64748B", fontSize: 12, marginTop: 2 }}>
+                  {(file.size / 1024 / 1024).toFixed(2)} MB · Click to change
+                </div>
+              </div>
+            ) : (
+              <div>
+                <div style={{ fontSize: 28, marginBottom: 8 }}>📁</div>
+                <div style={{ fontWeight: 600, color: "#4F46E5", fontSize: 14 }}>Click to upload a file</div>
+                <div style={{ color: "#94A3B8", fontSize: 12, marginTop: 4 }}>Students will be able to download it</div>
+              </div>
+            )}
+          </div>
+          <input ref={fileRef} type="file" style={{ display: "none" }} onChange={handleFile} />
+          {file && (
+            <button onClick={() => { setFile(null); setFileName(null); fileRef.current.value = ""; }} style={{ fontSize: 12, color: "#DC2626", background: "none", border: "none", cursor: "pointer", marginTop: 6 }}>
+              ✕ Remove file
+            </button>
+          )}
+        </div>
+
+        {/* Assign To */}
+        {classStudents.length > 0 && (
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <label className="lbl" style={{ margin: 0 }}>Assign To</label>
+              <button style={{ fontSize: 12, color: "#4F46E5", background: "none", border: "none", cursor: "pointer", fontWeight: 600 }}
+                onClick={() => setAssignedTo(classStudents.map(s => s.id))}>
+                Select All
+              </button>
+            </div>
+            <div style={{ maxHeight: 130, overflowY: "auto", background: "#F8FAFF", borderRadius: 10, padding: 8 }}>
+              {classStudents.map(s => (
+                <label key={s.id} className="ckl">
+                  <input type="checkbox" checked={assignedTo.includes(s.id)}
+                    onChange={() => setAssignedTo(p => p.includes(s.id) ? p.filter(x => x !== s.id) : [...p, s.id])}
+                    style={{ accentColor: "#4F46E5" }} />
+                  <div className="av" style={{ background: getAC(s.id), width: 28, height: 28, fontSize: 10 }}>{s.avatar || s.name[0]}</div>
+                  <span style={{ fontSize: 13, fontWeight: 500, color: "#0F172A" }}>{s.name}</span>
+                </label>
+              ))}
+            </div>
+            {assignedTo.length === 0 && <div style={{ fontSize: 11, color: "#94A3B8", marginTop: 4 }}>No selection = assign to all students</div>}
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+          <button className="btn2" onClick={close}>Cancel</button>
+          <button className="btn2" onClick={() => setStep(2)}>Add Questions →</button>
+          <button className="btn1" onClick={save} disabled={loading}>{loading ? "Saving…" : "Save Assignment"}</button>
+        </div>
+      </>}
+
+      {step === 2 && <>
+        <QuestionBuilder questions={questions} setQuestions={setQuestions} />
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 16 }}>
+          <button className="btn2" onClick={() => setStep(1)}>← Back</button>
+          <button className="btn1" onClick={save} disabled={loading}>{loading ? "Saving…" : `Save (${questions.length} question${questions.length !== 1 ? "s" : ""})`}</button>
+        </div>
+      </>}
+    </div>
+  );
 }
 
+
 // ── FIX 3: Edit Assignment Modal ──────────────────────────────────────────────
-function EditAssignmentModal({ assignments, reload, userId, data, close }) {
+function EditAssignmentModal({ assignments, classes, students, reload, userId, data, close }) {
   const a = data.assignment;
+
+  // Details state
   const [title, setTitle] = useState(a.title);
   const [subject, setSubject] = useState(a.subject);
   const [dueDate, setDueDate] = useState(a.due_date || "");
   const [desc, setDesc] = useState(a.description || "");
-  const [step, setStep] = useState(1);
+
+  // Questions state — pre-load existing questions
   const [questions, setQuestions] = useState(
-    (a.questions || []).map(q => ({ id: q.id, dbId: q.id, type: q.question_type, text: q.question_text, options: q.options || ["", "", "", ""], correct: q.correct_answer, explanation: q.explanation || "" }))
+    (a.questions || []).map(q => ({
+      id: q.id,
+      type: q.question_type,
+      text: q.question_text,
+      options: q.options || ["", "", "", ""],
+      correct: q.correct_answer,
+      explanation: q.explanation || ""
+    }))
   );
-  const [loading, setLoading] = useState(false); const [err, setErr] = useState("");
+
+  // Assign To state — pre-load existing assignees
+  const selClass = classes.find(c => c.id === a.class_id);
+  const classStudents = students.filter(s => selClass?.students.includes(s.id));
+  const [assignedTo, setAssignedTo] = useState(new Set(a.assignedTo || []));
+
+  const [step, setStep] = useState(1);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+
+  const toggleStudent = (id) => setAssignedTo(prev => {
+    const n = new Set(prev);
+    n.has(id) ? n.delete(id) : n.add(id);
+    return n;
+  });
 
   const save = async () => {
     setLoading(true); setErr("");
     try {
-      // Update assignment details
-      await db("assignments", "PATCH", `id=eq.${a.id}`, { title: title.trim(), subject, due_date: dueDate || null, description: desc });
-      // Delete all old questions and re-insert
+      // 1. Update assignment details
+      await db("assignments", "PATCH", `id=eq.${a.id}`, {
+        title: title.trim(),
+        subject,
+        due_date: dueDate || null,
+        description: desc
+      });
+
+      // 2. Update questions (delete all, re-insert)
       await db("questions", "DELETE", `assignment_id=eq.${a.id}`);
-      await Promise.all(questions.filter(q => q.text.trim() && q.correct).map((q, i) =>
-        db("questions", "POST", "", { assignment_id: a.id, question_text: q.text, question_type: q.type, options: q.type === "multiple_choice" ? q.options : null, correct_answer: q.correct, explanation: q.explanation || null, points: 1, order_index: i })
-      ));
-      await reload(); close();
-    } catch (e) { setErr(e.message); } finally { setLoading(false); }
+      if (questions.filter(q => q.text.trim() && q.correct).length > 0) {
+        await Promise.all(
+          questions.filter(q => q.text.trim() && q.correct).map((q, i) =>
+            db("questions", "POST", "", {
+              assignment_id: a.id,
+              question_text: q.text,
+              question_type: q.type,
+              options: q.type === "multiple_choice" ? q.options : null,
+              correct_answer: q.correct,
+              explanation: q.explanation || null,
+              points: 1,
+              order_index: i
+            })
+          )
+        );
+      }
+
+      // 3. Update assignment_students (diff old vs new)
+      const current = new Set(a.assignedTo || []);
+      const toAdd = [...assignedTo].filter(id => !current.has(id));
+      const toRemove = [...current].filter(id => !assignedTo.has(id));
+
+      await Promise.all([
+        ...toAdd.map(sid =>
+          db("assignment_students", "POST", "", { assignment_id: a.id, student_id: sid })
+        ),
+        ...toRemove.map(sid =>
+          db("assignment_students", "DELETE", `assignment_id=eq.${a.id}&student_id=eq.${sid}`)
+        )
+      ]);
+
+      await reload();
+      close();
+    } catch (e) { setErr(e.message); }
+    finally { setLoading(false); }
   };
 
-  return (<div>
-    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-      <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 22, fontWeight: 800, color: "#0F172A" }}>Edit Assignment</div>
-      <div style={{ display: "flex", gap: 6 }}>
-        <button onClick={() => setStep(1)} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: 600, background: step === 1 ? "#4F46E5" : "#F1F5F9", color: step === 1 ? "#fff" : "#475569" }}>① Details</button>
-        <button onClick={() => setStep(2)} style={{ padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: 600, background: step === 2 ? "#4F46E5" : "#F1F5F9", color: step === 2 ? "#fff" : "#475569" }}>② Questions {questions.length > 0 && `(${questions.length})`}</button>
+  return (
+    <div>
+      {/* Header with step tabs */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+        <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 22, fontWeight: 800, color: "#0F172A" }}>Edit Assignment</div>
+        <div style={{ display: "flex", gap: 6 }}>
+          {[
+            { n: 1, label: "① Details" },
+            { n: 2, label: `② Questions${questions.length > 0 ? ` (${questions.length})` : ""}` },
+            { n: 3, label: `③ Students (${assignedTo.size})` }
+          ].map(t => (
+            <button
+              key={t.n}
+              onClick={() => setStep(t.n)}
+              style={{
+                padding: "6px 14px", borderRadius: 8, border: "none", cursor: "pointer",
+                fontFamily: "inherit", fontSize: 13, fontWeight: 600,
+                background: step === t.n ? "#4F46E5" : "#F1F5F9",
+                color: step === t.n ? "#fff" : "#475569"
+              }}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
       </div>
+
+      {err && <div className="err">{err}</div>}
+
+      {/* ── Step 1: Details ── */}
+      {step === 1 && <>
+        <div style={{ marginBottom: 16 }}>
+          <label className="lbl">Title</label>
+          <input className="inp" value={title} onChange={e => setTitle(e.target.value)} />
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
+          <div>
+            <label className="lbl">Subject</label>
+            <select className="sel" value={subject} onChange={e => setSubject(e.target.value)}>
+              {SUBJECTS.map(s => <option key={s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="lbl">Due Date</label>
+            <input className="inp" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} />
+          </div>
+        </div>
+        <div style={{ marginBottom: 20 }}>
+          <label className="lbl">Instructions</label>
+          <textarea className="inp" rows={3} value={desc} onChange={e => setDesc(e.target.value)} style={{ resize: "vertical" }} />
+        </div>
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+          <button className="btn2" onClick={close}>Cancel</button>
+          <button className="btn2" onClick={() => setStep(2)}>Edit Questions →</button>
+          <button className="btn1" onClick={save} disabled={loading}>{loading ? "Saving…" : "Save Changes"}</button>
+        </div>
+      </>}
+
+      {/* ── Step 2: Questions ── */}
+      {step === 2 && <>
+        <div style={{ background: "#FEF3C7", borderRadius: 10, padding: "10px 14px", marginBottom: 16, fontSize: 13, color: "#92400E" }}>
+          ⚠️ Saving will replace all existing questions. Student answers already submitted will remain.
+        </div>
+        <QuestionBuilder questions={questions} setQuestions={setQuestions} />
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 16 }}>
+          <button className="btn2" onClick={() => setStep(1)}>← Back</button>
+          <button className="btn1" onClick={save} disabled={loading}>{loading ? "Saving…" : "Save Changes"}</button>
+        </div>
+      </>}
+
+      {/* ── Step 3: Assign To ── */}
+      {step === 3 && <>
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <label className="lbl" style={{ margin: 0 }}>
+              Select students to assign · <span style={{ color: "#4F46E5" }}>{assignedTo.size} selected</span>
+            </label>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                style={{ fontSize: 12, color: "#4F46E5", background: "none", border: "none", cursor: "pointer", fontWeight: 600 }}
+                onClick={() => setAssignedTo(new Set(classStudents.map(s => s.id)))}
+              >
+                Select All
+              </button>
+              <button
+                style={{ fontSize: 12, color: "#94A3B8", background: "none", border: "none", cursor: "pointer", fontWeight: 600 }}
+                onClick={() => setAssignedTo(new Set())}
+              >
+                Clear All
+              </button>
+            </div>
+          </div>
+
+          {classStudents.length === 0 ? (
+            <div style={{ textAlign: "center", color: "#94A3B8", padding: "20px 0" }}>
+              No students enrolled in this class yet.
+            </div>
+          ) : (
+            <div style={{ maxHeight: 300, overflowY: "auto", background: "#F8FAFF", borderRadius: 12, padding: 8 }}>
+              {classStudents.map(s => (
+                <label
+                  key={s.id}
+                  className="ckl"
+                  style={{ background: assignedTo.has(s.id) ? "#EEF2FF" : "transparent" }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={assignedTo.has(s.id)}
+                    onChange={() => toggleStudent(s.id)}
+                    style={{ accentColor: "#4F46E5" }}
+                  />
+                  <div className="av" style={{ background: getAC(s.id), width: 32, height: 32, fontSize: 11 }}>
+                    {s.avatar || s.name[0]}
+                  </div>
+                  <div>
+                    <div style={{ fontWeight: 500, fontSize: 14, color: "#0F172A" }}>{s.name}</div>
+                    <div style={{ fontSize: 11, color: "#64748B" }}>{s.grade}</div>
+                  </div>
+                  {assignedTo.has(s.id) && (
+                    <span style={{ marginLeft: "auto", fontSize: 11, color: "#4F46E5", fontWeight: 600 }}>✓ Assigned</span>
+                  )}
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+          <button className="btn2" onClick={() => setStep(1)}>← Back</button>
+          <button className="btn1" onClick={save} disabled={loading}>
+            {loading ? "Saving…" : `Save & Assign to ${assignedTo.size} student${assignedTo.size !== 1 ? "s" : ""}`}
+          </button>
+        </div>
+      </>}
     </div>
-    {err && <div className="err">{err}</div>}
-    {step === 1 && <>
-      <div style={{ marginBottom: 16 }}><label className="lbl">Title</label><input className="inp" value={title} onChange={e => setTitle(e.target.value)} /></div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
-        <div><label className="lbl">Subject</label><select className="sel" value={subject} onChange={e => setSubject(e.target.value)}>{SUBJECTS.map(s => <option key={s}>{s}</option>)}</select></div>
-        <div><label className="lbl">Due Date</label><input className="inp" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} /></div>
-      </div>
-      <div style={{ marginBottom: 20 }}><label className="lbl">Instructions</label><textarea className="inp" rows={3} value={desc} onChange={e => setDesc(e.target.value)} style={{ resize: "vertical" }} /></div>
-      <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}><button className="btn2" onClick={close}>Cancel</button><button className="btn2" onClick={() => setStep(2)}>Edit Questions →</button><button className="btn1" onClick={save} disabled={loading}>{loading ? "Saving…" : "Save Changes"}</button></div>
-    </>}
-    {step === 2 && <>
-      <div style={{ background: "#FEF3C7", borderRadius: 10, padding: "10px 14px", marginBottom: 16, fontSize: 13, color: "#92400E" }}>⚠️ Editing questions will replace all existing questions. Student answers already submitted will remain.</div>
-      <QuestionBuilder questions={questions} setQuestions={setQuestions} />
-      <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 16 }}><button className="btn2" onClick={() => setStep(1)}>← Back</button><button className="btn1" onClick={save} disabled={loading}>{loading ? "Saving…" : "Save Changes"}</button></div>
-    </>}
-  </div>);
+  );
 }
+
 
 // ── View Assignment / Results / Assign Students / View Class Modals ────────────
 function ViewAssignmentModal({ assignment: a, students, classes, close }) {
@@ -963,6 +1413,21 @@ function StudentApp({ initialData, session, onLogout }) {
   const openQuiz = (assignment) => { setActiveAssignment(assignment); setView("quiz"); };
   const closeQuiz = () => { setView("home"); setActiveAssignment(null); reload(); };
   if (view === "quiz" && activeAssignment) return <QuizInterface assignment={activeAssignment} student={data.student} session={session} onClose={closeQuiz} />;
+  if (!data?.student) {
+    return (
+      <div style={{ fontFamily: "'Inter','Outfit',sans-serif", minHeight: "100vh", background: "#F0F2F8", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <div className="card" style={{ textAlign: "center", padding: 40, maxWidth: 400 }}>
+          <div style={{ fontSize: 40, marginBottom: 12 }}>⚠️</div>
+          <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 18, fontWeight: 700, color: "#0F172A", marginBottom: 8 }}>Could not load your data</div>
+          <div style={{ color: "#64748B", fontSize: 14, marginBottom: 20 }}>
+            Your account was found but student data is missing. This usually means your teacher needs to enroll you in a class first.
+          </div>
+          <button onClick={onLogout} className="btn1">Sign Out & Try Again</button>
+        </div>
+      </div>
+    );
+  }
+
   const { student, classes, assignments } = data;
   const pending = assignments.filter(a => !a.submission || a.submission.status === "in_progress");
   const submitted = assignments.filter(a => a.submission?.status === "submitted");
@@ -979,20 +1444,39 @@ function StudentApp({ initialData, session, onLogout }) {
       </div>
       <div className="card">
         <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 17, fontWeight: 700, color: "#0F172A", marginBottom: 18 }}>My Assignments</div>
-        {assignments.length === 0 && <div style={{ textAlign: "center", color: "#94A3B8", padding: 20 }}>🎉 No assignments yet!</div>}
-        {assignments.map(a => {
+        {assignments.length === 0 && (
+  <div style={{ textAlign: "center", color: "#94A3B8", padding: 20 }}>🎉 No assignments yet!</div>
+)}
+
+{assignments.map(a => {
   const cls = classes.find(c => c.id === a.class_id);
   const sub = a.submission;
   const status = sub?.status || "not_started";
   const d = Math.ceil((new Date(a.due_date) - new Date()) / 86400000);
   const hasQ = a.questions && a.questions.length > 0;
 
-  const statusConfig = {
-    not_started: { color: "#4F46E5", bg: "#EEF2FF", btnLabel: hasQ ? "Start Assignment" : "View Details" },
-    in_progress:  { color: "#D97706", bg: "#FEF3C7", btnLabel: hasQ ? "Resume" : "View Details" },
-    submitted:    { color: "#059669", bg: "#D1FAE5", btnLabel: "View Results" }
-  };
-  const cfg = statusConfig[status];
+  // FIX 3: Clean button logic
+  // "View Results" only after submitting a quiz
+  // "View Assignment" for file/description-only assignments
+  // "Start"/"Resume" for quizzes
+  const btnConfig = (() => {
+    if (status === "submitted") {
+      return hasQ
+        ? { label: "View Results →", color: "#059669", bg: "#D1FAE5" }
+        : { label: "View Assignment →", color: "#475569", bg: "#F1F5F9" };
+    }
+    if (status === "in_progress") {
+      return { label: hasQ ? "Resume →" : "View Assignment →", color: "#D97706", bg: "#FEF3C7" };
+    }
+    // not_started
+    return { label: hasQ ? "Start Assignment →" : "View Assignment →", color: "#4F46E5", bg: "#EEF2FF" };
+  })();
+
+  const statusBadge = (() => {
+    if (status === "submitted") return { text: "Submitted ✓", color: "#059669" };
+    if (status === "in_progress") return { text: "In Progress", color: "#D97706" };
+    return { text: d <= 0 ? "Past due!" : `Due in ${d}d`, color: d <= 2 ? "#DC2626" : "#64748B" };
+  })();
 
   return (
     <div
@@ -1007,12 +1491,7 @@ function StudentApp({ initialData, session, onLogout }) {
       onMouseLeave={e => e.currentTarget.style.background = "transparent"}
     >
       {/* Icon */}
-      <div style={{
-        width: 44, height: 44, borderRadius: 12,
-        background: sc(a.subject).bg,
-        display: "flex", alignItems: "center", justifyContent: "center",
-        fontSize: 20, flexShrink: 0
-      }}>
+      <div style={{ width: 44, height: 44, borderRadius: 12, background: sc(a.subject).bg, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, flexShrink: 0 }}>
         {status === "submitted" ? "✅" : hasQ ? "📝" : "📄"}
       </div>
 
@@ -1023,39 +1502,26 @@ function StudentApp({ initialData, session, onLogout }) {
         {hasQ && (
           <div style={{ fontSize: 12, color: "#4F46E5", marginTop: 2 }}>
             {a.questions.length} question{a.questions.length !== 1 ? "s" : ""}
-            {status === "in_progress" && a.savedAnswers?.length > 0
-              ? ` · ${a.savedAnswers.length} answered`
-              : ""}
+            {status === "in_progress" && a.savedAnswers?.length > 0 ? ` · ${a.savedAnswers.length} answered` : ""}
           </div>
         )}
-        {status === "submitted" && sub && (
-          <div style={{
-            fontSize: 13, fontWeight: 700, marginTop: 4,
-            color: sub.percentage >= 70 ? "#059669" : sub.percentage >= 50 ? "#D97706" : "#DC2626"
-          }}>
+        {status === "submitted" && sub && hasQ && (
+          <div style={{ fontSize: 13, fontWeight: 700, marginTop: 4, color: sub.percentage >= 70 ? "#059669" : sub.percentage >= 50 ? "#D97706" : "#DC2626" }}>
             Score: {sub.score}/{sub.total_points} ({sub.percentage}%)
           </div>
         )}
       </div>
 
-      {/* Right side: due date + action button */}
+      {/* Right: status + button */}
       <div style={{ textAlign: "right", flexShrink: 0 }}>
-        <div style={{
-          fontSize: 11, fontWeight: 600, marginBottom: 8,
-          color: d <= 2 && status !== "submitted" ? "#DC2626" : "#64748B"
-        }}>
-          {status === "submitted" ? "Submitted ✓" : d <= 0 ? "Past due!" : `Due in ${d}d`}
+        <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8, color: statusBadge.color }}>
+          {statusBadge.text}
         </div>
         <button
-          style={{
-            padding: "8px 16px", borderRadius: 10, border: "none",
-            cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: 600,
-            background: cfg.bg, color: cfg.color,
-            transition: "opacity 0.15s"
-          }}
+          style={{ padding: "8px 16px", borderRadius: 10, border: "none", cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: 600, background: btnConfig.bg, color: btnConfig.color }}
           onClick={e => { e.stopPropagation(); openQuiz(a); }}
         >
-          {cfg.btnLabel} →
+          {btnConfig.label}
         </button>
       </div>
     </div>
@@ -1083,100 +1549,248 @@ function QuizInterface({ assignment, student, session, onClose }) {
       try {
         const qs = await db("questions", "GET", `assignment_id=eq.${assignment.id}&order=order_index.asc`);
         setQuestions(qs || []);
+        // Restore saved answers
         const saved = assignment.savedAnswers || [];
-        const ans = {}; saved.forEach(sa => { ans[sa.question_id] = sa.selected_answer; }); setAnswers(ans);
-        if (alreadySubmitted) { setSubmitted(true); setResult(assignment.submission); }
-      } catch (e) { console.error(e); } finally { setLoading(false); }
+        const ans = {};
+        saved.forEach(sa => { ans[sa.question_id] = sa.selected_answer; });
+        setAnswers(ans);
+        // If already submitted, load result
+        if (alreadySubmitted) {
+          setSubmitted(true);
+          setResult(assignment.submission);
+        }
+      } catch (e) { console.error("QuizInterface load error:", e); }
+      finally { setLoading(false); }
     })();
   }, []);
 
+  // FIX 1: use saveAnswer() with correct on_conflict
   const selectAnswer = async (questionId, answer) => {
     setAnswers(p => ({ ...p, [questionId]: answer }));
     setSavingQ(questionId);
     try {
-      await upsertDB("student_answers", { student_id: student.studentId, assignment_id: assignment.id, question_id: questionId, selected_answer: answer });
-      await upsertDB("submissions", { student_id: student.studentId, assignment_id: assignment.id, status: "in_progress", score: 0, total_points: questions.length, percentage: 0 });
-    } catch (e) { console.error(e); } finally { setSavingQ(null); }
+      await saveAnswer(student.studentId, assignment.id, questionId, answer);
+      await saveSubmission(student.studentId, assignment.id, {
+        status: "in_progress", score: 0,
+        total_points: questions.length, percentage: 0
+      });
+    } catch (e) { console.error("Save answer error:", e); }
+    finally { setSavingQ(null); }
   };
 
+  // FIX 1: use saveAnswer() + saveSubmission() with correct on_conflict
   const submit = async () => {
     if (!confirm("Submit your answers? You cannot change them after submitting.")) return;
     setSubmitting(true);
     try {
       let score = 0;
-      const updates = questions.map(q => { const selected = answers[q.id]; const correct = selected?.toLowerCase() === q.correct_answer?.toLowerCase(); if (correct) score++; return { student_id: student.studentId, assignment_id: assignment.id, question_id: q.id, selected_answer: selected || null, is_correct: correct }; });
-      await Promise.all(updates.map(u => upsertDB("student_answers", u)));
-      const total = questions.length; const pct = total > 0 ? Math.round((score / total) * 100) : 0;
-      await upsertDB("submissions", { student_id: student.studentId, assignment_id: assignment.id, status: "submitted", score, total_points: total, percentage: pct, submitted_at: new Date().toISOString() });
-      setResult({ score, total_points: total, percentage: pct }); setSubmitted(true);
-    } catch (e) { alert("Error submitting: " + e.message); } finally { setSubmitting(false); }
+      // Save all answers with is_correct flag
+      await Promise.all(questions.map(q => {
+        const selected = answers[q.id];
+        const correct = selected?.toLowerCase() === q.correct_answer?.toLowerCase();
+        if (correct) score++;
+        return saveAnswer(student.studentId, assignment.id, q.id, selected || null, correct);
+      }));
+      // Save final submission
+      const total = questions.length;
+      const pct = total > 0 ? Math.round((score / total) * 100) : 0;
+      await saveSubmission(student.studentId, assignment.id, {
+        status: "submitted", score, total_points: total,
+        percentage: pct, submitted_at: new Date().toISOString()
+      });
+      setResult({ score, total_points: total, percentage: pct });
+      setSubmitted(true);
+    } catch (e) { alert("Error submitting: " + e.message); }
+    finally { setSubmitting(false); }
   };
 
   const answered = Object.keys(answers).filter(k => answers[k]).length;
-
-  if (loading) return <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#F0F2F8", fontFamily: "'Inter','Outfit',sans-serif" }}><style>{CSS}</style><Loader text="Loading questions…" /></div>;
-
-  return (<div style={{ fontFamily: "'Inter','Outfit',sans-serif", minHeight: "100vh", background: "#F0F2F8" }}>
-    <style>{CSS}</style>
+  const header = (
     <div style={{ background: "linear-gradient(135deg,#0F172A,#1E1B4B)", padding: "16px 32px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 10 }}>
-      <div><div style={{ fontFamily: "Outfit,sans-serif", color: "#fff", fontWeight: 800, fontSize: 17 }}>{assignment.title}</div><div style={{ color: "#64748B", fontSize: 12 }}>{assignment.subject} · {questions.length} questions</div></div>
+      <div>
+        <div style={{ fontFamily: "Outfit,sans-serif", color: "#fff", fontWeight: 800, fontSize: 17 }}>{assignment.title}</div>
+        <div style={{ color: "#64748B", fontSize: 12 }}>{assignment.subject}{questions.length > 0 ? ` · ${questions.length} questions` : ""}</div>
+      </div>
       <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-        {!submitted && <div style={{ color: "#94A3B8", fontSize: 13 }}>{answered}/{questions.length} answered {savingQ && <span style={{ color: "#4F46E5" }}>· Saving…</span>}</div>}
+        {!submitted && questions.length > 0 && (
+          <div style={{ color: "#94A3B8", fontSize: 13 }}>
+            {answered}/{questions.length} answered {savingQ && <span style={{ color: "#818CF8" }}>· Saving…</span>}
+          </div>
+        )}
         <button onClick={onClose} style={{ background: "rgba(255,255,255,0.1)", color: "#E2E8F0", border: "none", padding: "7px 14px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 600, fontFamily: "inherit" }}>← Back</button>
       </div>
     </div>
-    {!submitted && <div style={{ height: 4, background: "#1E293B" }}><div style={{ height: "100%", background: "#4F46E5", transition: "width 0.3s", width: `${questions.length > 0 ? (answered / questions.length) * 100 : 0}%` }} /></div>}
+  );
 
-    <div style={{ maxWidth: 720, margin: "0 auto", padding: "32px 20px" }}>
-      {submitted && result && <div className="fade" style={{ background: result.percentage >= 70 ? "linear-gradient(135deg,#059669,#047857)" : result.percentage >= 50 ? "linear-gradient(135deg,#D97706,#B45309)" : "linear-gradient(135deg,#DC2626,#B91C1C)", borderRadius: 20, padding: 32, marginBottom: 32, textAlign: "center", color: "#fff" }}>
-        <div style={{ fontSize: 48, marginBottom: 8 }}>{result.percentage >= 70 ? "🏆" : result.percentage >= 50 ? "👍" : "📚"}</div>
-        <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 48, fontWeight: 800 }}>{result.percentage}%</div>
-        <div style={{ fontSize: 18, marginTop: 4, opacity: 0.9 }}>{result.score} out of {result.total_points} correct</div>
-        <div style={{ fontSize: 14, marginTop: 8, opacity: 0.8 }}>{result.percentage >= 70 ? "Great job! 🌟" : result.percentage >= 50 ? "Good effort! Review missed questions below." : "Keep practicing — you'll get there! 💪"}</div>
-      </div>}
+  if (loading) return (
+    <div style={{ fontFamily: "'Inter','Outfit',sans-serif", minHeight: "100vh", background: "#F0F2F8" }}>
+      <style>{CSS}</style>{header}<Loader text="Loading assignment…" />
+    </div>
+  );
 
-      {questions.map((q, i) => {
-        const selected = answers[q.id]; const isSubmitted = submitted;
-        const isCorrect = selected?.toLowerCase() === q.correct_answer?.toLowerCase();
-        const opts = q.question_type === "true_false" ? ["true", "false"] : q.options || [];
-        const optLabels = q.question_type === "multiple_choice" ? ["A", "B", "C", "D"] : null;
-        return (<div key={q.id} className={`qcard fade${selected ? " answered" : ""}`}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
-            <div style={{ display: "flex", gap: 10, alignItems: "flex-start", flex: 1 }}>
-              <div style={{ width: 28, height: 28, borderRadius: "50%", background: isSubmitted ? (isCorrect ? "#10B981" : selected ? "#EF4444" : "#94A3B8") : "#4F46E5", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 12, flexShrink: 0 }}>{i + 1}</div>
-              {/* FIX 1: Render math in question text */}
-              <div style={{ fontWeight: 600, color: "#0F172A", fontSize: 15, lineHeight: 1.5 }}><MathText text={q.question_text} /></div>
+  // FIX 2: No questions → show assignment details instead of empty quiz
+  if (questions.length === 0) {
+    return (
+      <div style={{ fontFamily: "'Inter','Outfit',sans-serif", minHeight: "100vh", background: "#F0F2F8" }}>
+        <style>{CSS}</style>
+        {header}
+        <div style={{ maxWidth: 680, margin: "0 auto", padding: "32px 20px" }}>
+          <div className="card fade">
+            <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 20 }}>
+              <div style={{ width: 52, height: 52, borderRadius: 14, background: sc(assignment.subject).bg, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 26 }}>📄</div>
+              <div>
+                <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 20, fontWeight: 800, color: "#0F172A" }}>{assignment.title}</div>
+                <div style={{ color: "#64748B", fontSize: 13, marginTop: 2 }}>{assignment.subject} · Due {assignment.due_date}</div>
+              </div>
             </div>
-            {isSubmitted && selected && <span style={{ fontSize: 20 }}>{isCorrect ? "✅" : "❌"}</span>}
+            {assignment.description && (
+              <div style={{ background: "#F8FAFF", borderRadius: 12, padding: "14px 18px", marginBottom: 16, color: "#475569", fontSize: 14, lineHeight: 1.6, border: "1.5px solid #E8EEFF" }}>
+                {assignment.description}
+              </div>
+            )}
+            {assignment.file_url ? (
+  // Has real stored file — show download link
+  <a
+    href={assignment.file_url}
+    target="_blank"
+    rel="noopener noreferrer"
+    download={assignment.file_name}
+    style={{
+      display: "flex", alignItems: "center", gap: 12,
+      padding: "14px 18px", background: "#EEF2FF",
+      borderRadius: 12, marginBottom: 16,
+      textDecoration: "none", border: "2px solid #C7D2FE",
+      transition: "all 0.18s"
+    }}
+    onMouseEnter={e => e.currentTarget.style.background = "#E0E7FF"}
+    onMouseLeave={e => e.currentTarget.style.background = "#EEF2FF"}
+  >
+    <span style={{ fontSize: 26 }}>📎</span>
+    <div style={{ flex: 1 }}>
+      <div style={{ color: "#4F46E5", fontWeight: 700, fontSize: 14 }}>{assignment.file_name}</div>
+      <div style={{ color: "#818CF8", fontSize: 12, marginTop: 2 }}>Click to open / download</div>
+    </div>
+    <span style={{ fontSize: 20 }}>⬇️</span>
+  </a>
+) : assignment.file_name ? (
+  // Has filename but no URL (old assignment — file wasn't uploaded to storage)
+  <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 16px", background: "#F1F5F9", borderRadius: 12, marginBottom: 16, border: "2px solid #E2E8F0" }}>
+    <span style={{ fontSize: 22 }}>📎</span>
+    <div>
+      <div style={{ color: "#475569", fontWeight: 600, fontSize: 14 }}>{assignment.file_name}</div>
+      <div style={{ color: "#94A3B8", fontSize: 12, marginTop: 2 }}>File reference only — ask your teacher to re-upload</div>
+    </div>
+  </div>
+) : null}
+
+            {!assignment.description && !assignment.file_name && (
+              <div style={{ color: "#94A3B8", textAlign: "center", padding: "20px 0" }}>No additional details for this assignment.</div>
+            )}
+            <div style={{ marginTop: 20, display: "flex", justifyContent: "center" }}>
+              <button className="btn2" onClick={onClose}>← Back to Assignments</button>
+            </div>
           </div>
-          <div style={{ paddingLeft: 38 }}>
-            {opts.map((opt, oi) => {
-              const label = optLabels ? optLabels[oi] : null; const val = optLabels ? label : opt;
-              const isSelected = selected === val; const isCorrectOpt = q.correct_answer?.toLowerCase() === val?.toLowerCase();
-              let cls = "opt";
-              if (isSubmitted) { if (isCorrectOpt) cls += " correct"; else if (isSelected && !isCorrectOpt) cls += " wrong"; }
-              else if (isSelected) cls += " selected";
-              return (<div key={oi} className={cls} onClick={() => !isSubmitted && selectAnswer(q.id, val)}>
-                {label && <span style={{ width: 26, height: 26, borderRadius: "50%", background: isSubmitted ? (isCorrectOpt ? "#10B981" : isSelected ? "#EF4444" : "#E2E8F0") : (isSelected ? "#4F46E5" : "#E2E8F0"), color: isSubmitted ? (isCorrectOpt || isSelected ? "#fff" : "#64748B") : (isSelected ? "#fff" : "#64748B"), display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 11, flexShrink: 0 }}>{label}</span>}
-                <span style={{ fontWeight: 500, fontSize: 14, color: "#0F172A", textTransform: "capitalize" }}><MathText text={opt} /></span>
-                {isSubmitted && isCorrectOpt && <span style={{ marginLeft: "auto", fontSize: 12, color: "#059669", fontWeight: 600 }}>✓ Correct answer</span>}
-              </div>);
-            })}
-            {/* FIX 2: Show explanation after submit */}
-            {isSubmitted && q.explanation && (
-              <div className="explanation-box">
-                <strong>💡 Explanation:</strong> <MathText text={q.explanation} />
+        </div>
+      </div>
+    );
+  }
+
+  // Full quiz interface (assignment has questions)
+  return (
+    <div style={{ fontFamily: "'Inter','Outfit',sans-serif", minHeight: "100vh", background: "#F0F2F8" }}>
+      <style>{CSS}</style>
+      {header}
+      {!submitted && (
+        <div style={{ height: 4, background: "#1E293B" }}>
+          <div style={{ height: "100%", background: "#4F46E5", transition: "width 0.3s", width: `${questions.length > 0 ? (answered / questions.length) * 100 : 0}%` }} />
+        </div>
+      )}
+
+      <div style={{ maxWidth: 720, margin: "0 auto", padding: "32px 20px" }}>
+        {/* Score banner after submission */}
+        {submitted && result && (
+          <div className="fade" style={{ background: result.percentage >= 70 ? "linear-gradient(135deg,#059669,#047857)" : result.percentage >= 50 ? "linear-gradient(135deg,#D97706,#B45309)" : "linear-gradient(135deg,#DC2626,#B91C1C)", borderRadius: 20, padding: 32, marginBottom: 32, textAlign: "center", color: "#fff" }}>
+            <div style={{ fontSize: 48, marginBottom: 8 }}>{result.percentage >= 70 ? "🏆" : result.percentage >= 50 ? "👍" : "📚"}</div>
+            <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 48, fontWeight: 800 }}>{result.percentage}%</div>
+            <div style={{ fontSize: 18, marginTop: 4, opacity: 0.9 }}>{result.score} out of {result.total_points} correct</div>
+            <div style={{ fontSize: 14, marginTop: 8, opacity: 0.8 }}>
+              {result.percentage >= 70 ? "Great job! 🌟" : result.percentage >= 50 ? "Good effort! Review the answers below." : "Keep practicing — you'll get there! 💪"}
+            </div>
+          </div>
+        )}
+
+        {/* Questions */}
+        {questions.map((q, i) => {
+          const selected = answers[q.id];
+          const isCorrect = selected?.toLowerCase() === q.correct_answer?.toLowerCase();
+          const opts = q.question_type === "true_false" ? ["true", "false"] : (q.options || []);
+          const optLabels = q.question_type === "multiple_choice" ? ["A", "B", "C", "D"] : null;
+
+          return (
+            <div key={q.id} className={`qcard fade${selected ? " answered" : ""}`}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
+                <div style={{ display: "flex", gap: 10, alignItems: "flex-start", flex: 1 }}>
+                  <div style={{ width: 28, height: 28, borderRadius: "50%", background: submitted ? (isCorrect ? "#10B981" : selected ? "#EF4444" : "#94A3B8") : "#4F46E5", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 12, flexShrink: 0 }}>{i + 1}</div>
+                  <div style={{ fontWeight: 600, color: "#0F172A", fontSize: 15, lineHeight: 1.5 }}>
+                    <MathText text={q.question_text} />
+                  </div>
+                </div>
+                {submitted && selected && <span style={{ fontSize: 20 }}>{isCorrect ? "✅" : "❌"}</span>}
+              </div>
+
+              <div style={{ paddingLeft: 38 }}>
+                {opts.map((opt, oi) => {
+                  const label = optLabels ? optLabels[oi] : null;
+                  const val = optLabels ? label : opt;
+                  const isSelected = selected === val;
+                  const isCorrectOpt = q.correct_answer?.toLowerCase() === val?.toLowerCase();
+                  let cls = "opt";
+                  if (submitted) { if (isCorrectOpt) cls += " correct"; else if (isSelected && !isCorrectOpt) cls += " wrong"; }
+                  else if (isSelected) cls += " selected";
+
+                  return (
+                    <div key={oi} className={cls} onClick={() => !submitted && selectAnswer(q.id, val)}>
+                      {label && (
+                        <span style={{ width: 26, height: 26, borderRadius: "50%", background: submitted ? (isCorrectOpt ? "#10B981" : isSelected ? "#EF4444" : "#E2E8F0") : (isSelected ? "#4F46E5" : "#E2E8F0"), color: submitted ? (isCorrectOpt || isSelected ? "#fff" : "#64748B") : (isSelected ? "#fff" : "#64748B"), display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 11, flexShrink: 0 }}>{label}</span>
+                      )}
+                      <span style={{ fontWeight: 500, fontSize: 14, color: "#0F172A", textTransform: "capitalize" }}>
+                        <MathText text={opt} />
+                      </span>
+                      {submitted && isCorrectOpt && <span style={{ marginLeft: "auto", fontSize: 12, color: "#059669", fontWeight: 600 }}>✓ Correct answer</span>}
+                    </div>
+                  );
+                })}
+
+                {/* Explanation after submit */}
+                {submitted && q.explanation && (
+                  <div className="explanation-box">
+                    <strong>💡 Explanation:</strong> <MathText text={q.explanation} />
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+
+        {/* Submit / Back buttons */}
+        {!submitted && (
+          <div style={{ textAlign: "center", marginTop: 24 }}>
+            <button className="btn1" onClick={submit} disabled={submitting || answered === 0} style={{ padding: "14px 48px", fontSize: 16 }}>
+              {submitting ? "Grading your answers…" : `Submit Assignment (${answered}/${questions.length} answered)`}
+            </button>
+            {answered < questions.length && (
+              <div style={{ fontSize: 12, color: "#94A3B8", marginTop: 8 }}>
+                Unanswered questions will be marked as incorrect.
               </div>
             )}
           </div>
-        </div>);
-      })}
-
-      {!submitted && <div style={{ textAlign: "center", marginTop: 24 }}>
-        <button className="btn1" onClick={submit} disabled={submitting || answered === 0} style={{ padding: "14px 48px", fontSize: 16 }}>{submitting ? "Grading your answers…" : `Submit Assignment (${answered}/${questions.length} answered)`}</button>
-        {answered < questions.length && <div style={{ fontSize: 12, color: "#94A3B8", marginTop: 8 }}>Unanswered questions will be marked as incorrect.</div>}
-      </div>}
-      {submitted && <div style={{ textAlign: "center", marginTop: 24 }}><button className="btn1" onClick={onClose} style={{ padding: "12px 32px" }}>← Back to My Assignments</button></div>}
+        )}
+        {submitted && (
+          <div style={{ textAlign: "center", marginTop: 24 }}>
+            <button className="btn1" onClick={onClose} style={{ padding: "12px 32px" }}>← Back to My Assignments</button>
+          </div>
+        )}
+      </div>
     </div>
-  </div>);
+  );
 }
