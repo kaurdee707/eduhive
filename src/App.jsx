@@ -894,53 +894,184 @@ function AddStudentModal({ reload, userId, close }) {
 }
 // ── FIX 2 & 3: Question Builder (shared between Add and Edit) ─────────────────
 function QuestionBuilder({ questions, setQuestions }) {
-  const addQuestion = (type) => setQuestions(p => [...p, { id: Date.now(), type, text: "", options: type === "multiple_choice" ? ["", "", "", ""] : [], correct: type === "true_false" ? "true" : "", explanation: "" }]);
-  const updateQ = (id, field, val) => setQuestions(p => p.map(q => q.id === id ? { ...q, [field]: val } : q));
-  const updateOpt = (qid, idx, val) => setQuestions(p => p.map(q => q.id === qid ? { ...q, options: q.options.map((o, i) => i === idx ? val : o) } : q));
+  const [showLibrary, setShowLibrary] = useState(false);
+
+  const addQuestion = (type) => {
+    setQuestions(p => [...p, {
+      id: Date.now(),
+      type, text: "",
+      options: type === "multiple_choice" ? ["", "", "", ""] : [],
+      correct: type === "true_false" ? "true" : "",
+      explanation: ""
+    }]);
+  };
+
+  const updateQ = (id, field, val) =>
+    setQuestions(p => p.map(q => q.id === id ? { ...q, [field]: val } : q));
+
+  const updateOpt = (qid, idx, val) =>
+    setQuestions(p => p.map(q => q.id === qid
+      ? { ...q, options: q.options.map((o, i) => i === idx ? val : o) }
+      : q
+    ));
+
   const removeQ = (id) => setQuestions(p => p.filter(q => q.id !== id));
-  return (<>
-    <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
-      <button className="btn1" onClick={() => addQuestion("multiple_choice")} style={{ fontSize: 13 }}>+ Multiple Choice</button>
-      <button className="btn1" onClick={() => addQuestion("true_false")} style={{ fontSize: 13, background: "#059669" }}>+ True / False</button>
-    </div>
-    {questions.length === 0 && <div style={{ textAlign: "center", padding: "24px 0", color: "#94A3B8" }}><div style={{ fontSize: 32 }}>❓</div><div style={{ marginTop: 8 }}>No questions yet. Add some above!</div></div>}
-    {questions.map((q, qi) => (
-      <div key={q.id} className="qcard">
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-          <span className="bdg" style={{ background: q.type === "true_false" ? "#D1FAE5" : "#EDE9FE", color: q.type === "true_false" ? "#065F46" : "#5B21B6" }}>{q.type === "true_false" ? "True / False" : "Multiple Choice"} · Q{qi + 1}</span>
-          <button className="btnd" onClick={() => removeQ(q.id)} style={{ padding: "4px 10px", fontSize: 12 }}>Remove</button>
+
+  const addFromLibrary = (newQuestions) => {
+    setQuestions(p => [...p, ...newQuestions]);
+  };
+
+  return (
+    <>
+      {/* Library Browser Modal */}
+      {showLibrary && (
+        <div className="ovl" onClick={() => setShowLibrary(false)}>
+          <div className="modal" style={{ width: 680 }} onClick={e => e.stopPropagation()}>
+            <LibraryBrowser onAdd={addFromLibrary} close={() => setShowLibrary(false)} />
+          </div>
         </div>
-        {/* FIX 1: Question text supports math preview */}
-        <textarea className="inp" rows={2} placeholder="Enter question text… (use $formula$ for math, e.g. $x^2 + 3$)" value={q.text} onChange={e => updateQ(q.id, "text", e.target.value)} style={{ marginBottom: 8, resize: "vertical" }} />
-        {q.text && (
-  <div style={{
-    background: "#F0F9FF",
-    border: "1.5px solid #BAE6FD",
-    borderRadius: 8,
-    padding: "10px 14px",
-    marginBottom: 12,
-    fontSize: 14,
-    color: "#0369A1"
-  }}>
-    <span style={{ fontSize: 11, fontWeight: 700, color: "#0284C7", textTransform: "uppercase", letterSpacing: "0.05em", display: "block", marginBottom: 4 }}>👁 Preview</span>
-    <MathText text={q.text} />
-  </div>
-)}
-        {q.type === "multiple_choice" && <>
-          <div style={{ marginBottom: 8 }}>{["A", "B", "C", "D"].map((opt, i) => (<div key={opt} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-            <span style={{ width: 24, height: 24, borderRadius: "50%", background: q.correct === opt ? "#4F46E5" : "#E2E8F0", color: q.correct === opt ? "#fff" : "#64748B", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, flexShrink: 0, cursor: "pointer" }} onClick={() => updateQ(q.id, "correct", opt)}>{opt}</span>
-            <input className="inp" style={{ flex: 1 }} placeholder={`Option ${opt}`} value={q.options[i]} onChange={e => updateOpt(q.id, i, e.target.value)} />
-          </div>))}</div>
-          <div style={{ fontSize: 12, color: "#64748B", marginBottom: 10 }}>Click a letter to mark it as the correct answer. Current: <strong style={{ color: "#4F46E5" }}>{q.correct || "None selected"}</strong></div>
-        </>}
-        {q.type === "true_false" && <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
-          {["true", "false"].map(v => <button key={v} onClick={() => updateQ(q.id, "correct", v)} style={{ flex: 1, padding: "10px", border: "2px solid", borderColor: q.correct === v ? "#4F46E5" : "#E2E8F0", borderRadius: 10, background: q.correct === v ? "#EEF2FF" : "#fff", color: q.correct === v ? "#4F46E5" : "#475569", fontWeight: 600, cursor: "pointer", fontSize: 14, fontFamily: "inherit", textTransform: "capitalize" }}>{v}</button>)}
-        </div>}
-        {/* FIX 2: Explanation field */}
-        <div><label className="lbl" style={{ color: "#D97706" }}>💡 Explanation (shown after student submits)</label><textarea className="inp" rows={2} placeholder="Explain why the answer is correct…" value={q.explanation || ""} onChange={e => updateQ(q.id, "explanation", e.target.value)} style={{ resize: "vertical", borderColor: "#FCD34D" }} /></div>
+      )}
+
+      {/* Toolbar */}
+      <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
+        <button className="btn1" onClick={() => addQuestion("multiple_choice")} style={{ fontSize: 13 }}>
+          + Multiple Choice
+        </button>
+        <button className="btn1" onClick={() => addQuestion("true_false")} style={{ fontSize: 13, background: "#059669" }}>
+          + True / False
+        </button>
+        <button
+          onClick={() => setShowLibrary(true)}
+          style={{
+            padding: "10px 18px", borderRadius: 10, border: "2px solid #4F46E5",
+            background: "#EEF2FF", color: "#4F46E5", cursor: "pointer",
+            fontSize: 13, fontWeight: 600, fontFamily: "inherit",
+            display: "flex", alignItems: "center", gap: 6, transition: "all 0.18s"
+          }}
+        >
+          📚 Browse Library
+        </button>
+        {questions.length > 0 && (
+          <div style={{ marginLeft: "auto", fontSize: 13, color: "#64748B", display: "flex", alignItems: "center" }}>
+            {questions.length} question{questions.length !== 1 ? "s" : ""} added
+          </div>
+        )}
       </div>
-    ))}
-  </>);
+
+      {/* Empty state */}
+      {questions.length === 0 && (
+        <div style={{ textAlign: "center", padding: "32px 0", color: "#94A3B8", background: "#F8FAFF", borderRadius: 12 }}>
+          <div style={{ fontSize: 36, marginBottom: 8 }}>❓</div>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>No questions yet</div>
+          <div style={{ fontSize: 13 }}>Add manually above or browse the question library</div>
+        </div>
+      )}
+
+      {/* Question cards */}
+      {questions.map((q, qi) => (
+        <div key={q.id} className="qcard">
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <span className="bdg" style={{
+              background: q.type === "true_false" ? "#D1FAE5" : "#EDE9FE",
+              color: q.type === "true_false" ? "#065F46" : "#5B21B6"
+            }}>
+              {q.type === "true_false" ? "True / False" : "Multiple Choice"} · Q{qi + 1}
+            </span>
+            <button className="btnd" onClick={() => removeQ(q.id)} style={{ padding: "4px 10px", fontSize: 12 }}>
+              Remove
+            </button>
+          </div>
+
+          {/* Question text */}
+          <textarea
+            className="inp"
+            rows={2}
+            placeholder="Enter question text… (use $formula$ for math, e.g. $x^2 + 3$)"
+            value={q.text}
+            onChange={e => updateQ(q.id, "text", e.target.value)}
+            style={{ marginBottom: 8, resize: "vertical" }}
+          />
+
+          {/* Math preview */}
+          {q.text && q.text.includes("$") && (
+            <div style={{ background: "#F0F9FF", border: "1.5px solid #BAE6FD", borderRadius: 8, padding: "8px 12px", marginBottom: 10, fontSize: 14, color: "#0369A1" }}>
+              <span style={{ fontSize: 11, fontWeight: 700, color: "#0284C7", textTransform: "uppercase", letterSpacing: "0.05em", marginRight: 8 }}>Preview:</span>
+              <MathText text={q.text} />
+            </div>
+          )}
+
+          {/* Multiple choice options */}
+          {q.type === "multiple_choice" && (
+            <>
+              <div style={{ marginBottom: 8 }}>
+                {["A", "B", "C", "D"].map((opt, i) => (
+                  <div key={opt} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                    <span
+                      onClick={() => updateQ(q.id, "correct", opt)}
+                      style={{
+                        width: 26, height: 26, borderRadius: "50%", flexShrink: 0,
+                        background: q.correct === opt ? "#4F46E5" : "#E2E8F0",
+                        color: q.correct === opt ? "#fff" : "#64748B",
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        fontSize: 11, fontWeight: 700, cursor: "pointer"
+                      }}
+                    >
+                      {opt}
+                    </span>
+                    <input
+                      className="inp"
+                      style={{ flex: 1 }}
+                      placeholder={`Option ${opt}`}
+                      value={q.options[i] || ""}
+                      onChange={e => updateOpt(q.id, i, e.target.value)}
+                    />
+                  </div>
+                ))}
+              </div>
+              <div style={{ fontSize: 12, color: "#64748B", marginBottom: 10 }}>
+                Click a letter to mark correct answer. Current: <strong style={{ color: "#4F46E5" }}>{q.correct || "None"}</strong>
+              </div>
+            </>
+          )}
+
+          {/* True/False */}
+          {q.type === "true_false" && (
+            <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+              {["true", "false"].map(v => (
+                <button
+                  key={v}
+                  onClick={() => updateQ(q.id, "correct", v)}
+                  style={{
+                    flex: 1, padding: "10px", borderRadius: 10,
+                    border: `2px solid ${q.correct === v ? "#4F46E5" : "#E2E8F0"}`,
+                    background: q.correct === v ? "#EEF2FF" : "#fff",
+                    color: q.correct === v ? "#4F46E5" : "#475569",
+                    fontWeight: 600, cursor: "pointer", fontSize: 14,
+                    fontFamily: "inherit", textTransform: "capitalize"
+                  }}
+                >
+                  {v}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Explanation */}
+          <div>
+            <label className="lbl" style={{ color: "#D97706" }}>💡 Explanation <span style={{ fontWeight: 400, textTransform: "none", color: "#94A3B8" }}>(shown to student after submission)</span></label>
+            <textarea
+              className="inp"
+              rows={2}
+              placeholder="Explain why the answer is correct…"
+              value={q.explanation || ""}
+              onChange={e => updateQ(q.id, "explanation", e.target.value)}
+              style={{ resize: "vertical", borderColor: q.explanation ? "#FCD34D" : "#E2E8F0" }}
+            />
+          </div>
+        </div>
+      ))}
+    </>
+  );
 }
 
 // ── Add Assignment Modal ──────────────────────────────────────────────────────
@@ -1532,6 +1663,262 @@ function StudentApp({ initialData, session, onLogout }) {
     </div>}
   </div>);
 }
+function LibraryBrowser({ onAdd, close }) {
+  const [grade, setGrade] = useState("Grade 8");
+  const [subject, setSubject] = useState("Math");
+  const [topic, setTopic] = useState("");
+  const [questions, setQuestions] = useState([]);
+  const [topics, setTopics] = useState([]);
+  const [selected, setSelected] = useState(new Set());
+  const [loading, setLoading] = useState(false);
+  const [searched, setSearched] = useState(false);
+
+  // Load available topics when grade+subject changes
+  useEffect(() => {
+    if (!grade || !subject) return;
+    (async () => {
+      try {
+        const rows = await db(
+          "question_library", "GET",
+          `grade=eq.${encodeURIComponent(grade)}&subject=eq.${encodeURIComponent(subject)}&select=topic`
+        );
+        const uniqueTopics = [...new Set((rows || []).map(r => r.topic))].sort();
+        setTopics(uniqueTopics);
+        if (uniqueTopics.length > 0) setTopic(uniqueTopics[0]);
+        else setTopic("");
+      } catch (e) { console.error(e); }
+    })();
+  }, [grade, subject]);
+
+  const search = async () => {
+    if (!grade || !subject || !topic) return;
+    setLoading(true); setSelected(new Set()); setSearched(true);
+    try {
+      const rows = await db(
+        "question_library", "GET",
+        `grade=eq.${encodeURIComponent(grade)}&subject=eq.${encodeURIComponent(subject)}&topic=eq.${encodeURIComponent(topic)}&order=created_at.asc`
+      );
+      setQuestions(rows || []);
+    } catch (e) { console.error(e); setQuestions([]); }
+    finally { setLoading(false); }
+  };
+
+  // Auto-search when topic changes
+  useEffect(() => { if (topic) search(); }, [topic]);
+
+  const toggle = (id) => setSelected(prev => {
+    const n = new Set(prev);
+    n.has(id) ? n.delete(id) : n.add(id);
+    return n;
+  });
+
+  const selectAll = () => setSelected(new Set(questions.map(q => q.id)));
+  const clearAll = () => setSelected(new Set());
+
+  const addSelected = () => {
+    const toAdd = questions
+      .filter(q => selected.has(q.id))
+      .map(q => ({
+        id: Date.now() + Math.random(), // local temp id
+        type: q.question_type,
+        text: q.question_text,
+        options: q.options || ["", "", "", ""],
+        correct: q.correct_answer,
+        explanation: q.explanation || ""
+      }));
+    onAdd(toAdd);
+    close();
+  };
+
+  const typeColor = (type) => type === "true_false"
+    ? { bg: "#D1FAE5", text: "#065F46" }
+    : { bg: "#EDE9FE", text: "#5B21B6" };
+
+  return (
+    <div style={{ fontFamily: "'Inter','Outfit',sans-serif" }}>
+      {/* Header */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+        <div>
+          <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 22, fontWeight: 800, color: "#0F172A" }}>
+            📚 Question Library
+          </div>
+          <div style={{ color: "#64748B", fontSize: 13, marginTop: 2 }}>
+            Browse and add questions to your assignment
+          </div>
+        </div>
+        <button onClick={close} style={{ background: "none", border: "none", fontSize: 22, cursor: "pointer", color: "#94A3B8" }}>✕</button>
+      </div>
+
+      {/* Filters */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 16 }}>
+        <div>
+          <label className="lbl">Grade</label>
+          <select className="sel" value={grade} onChange={e => setGrade(e.target.value)}>
+            {GRADES.map(g => <option key={g}>{g}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="lbl">Subject</label>
+          <select className="sel" value={subject} onChange={e => setSubject(e.target.value)}>
+            {SUBJECTS.map(s => <option key={s}>{s}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="lbl">Topic</label>
+          <select className="sel" value={topic} onChange={e => setTopic(e.target.value)} disabled={topics.length === 0}>
+            {topics.length === 0
+              ? <option>No topics found</option>
+              : topics.map(t => <option key={t}>{t}</option>)
+            }
+          </select>
+        </div>
+      </div>
+
+      {/* Results header */}
+      {searched && !loading && (
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+          <div style={{ fontSize: 13, color: "#64748B" }}>
+            {questions.length} question{questions.length !== 1 ? "s" : ""} found
+            {selected.size > 0 && <span style={{ color: "#4F46E5", fontWeight: 600, marginLeft: 8 }}>· {selected.size} selected</span>}
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={selectAll} style={{ fontSize: 12, color: "#4F46E5", background: "none", border: "none", cursor: "pointer", fontWeight: 600 }}>Select All</button>
+            <button onClick={clearAll} style={{ fontSize: 12, color: "#94A3B8", background: "none", border: "none", cursor: "pointer", fontWeight: 600 }}>Clear</button>
+          </div>
+        </div>
+      )}
+
+      {/* Loading */}
+      {loading && (
+        <div style={{ textAlign: "center", padding: "32px 0", color: "#64748B" }}>
+          <div style={{ width: 32, height: 32, border: "3px solid #E2E8F0", borderTopColor: "#4F46E5", borderRadius: "50%", animation: "spin 0.8s linear infinite", margin: "0 auto 12px" }} />
+          Loading questions…
+        </div>
+      )}
+
+      {/* No results */}
+      {searched && !loading && questions.length === 0 && (
+        <div style={{ textAlign: "center", padding: "32px 0", color: "#94A3B8" }}>
+          <div style={{ fontSize: 36, marginBottom: 8 }}>📭</div>
+          No questions found for this combination yet.
+        </div>
+      )}
+
+      {/* Question list */}
+      {!loading && questions.length > 0 && (
+        <div style={{ maxHeight: 380, overflowY: "auto", border: "1.5px solid #E2E8F0", borderRadius: 12, marginBottom: 16 }}>
+          {questions.map((q, i) => {
+            const sel = selected.has(q.id);
+            const tc = typeColor(q.question_type);
+            return (
+              <div
+                key={q.id}
+                onClick={() => toggle(q.id)}
+                style={{
+                  display: "flex", alignItems: "flex-start", gap: 14,
+                  padding: "14px 16px",
+                  borderBottom: i < questions.length - 1 ? "1px solid #F1F5F9" : "none",
+                  background: sel ? "#EEF2FF" : "#fff",
+                  cursor: "pointer", transition: "background 0.15s"
+                }}
+              >
+                {/* Checkbox */}
+                <div style={{
+                  width: 22, height: 22, borderRadius: 6, flexShrink: 0, marginTop: 1,
+                  border: `2px solid ${sel ? "#4F46E5" : "#CBD5E1"}`,
+                  background: sel ? "#4F46E5" : "#fff",
+                  display: "flex", alignItems: "center", justifyContent: "center"
+                }}>
+                  {sel && <span style={{ color: "#fff", fontSize: 13, fontWeight: 700 }}>✓</span>}
+                </div>
+
+                {/* Content */}
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: "#94A3B8" }}>Q{i + 1}</span>
+                    <span style={{ fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 20, background: tc.bg, color: tc.text }}>
+                      {q.question_type === "true_false" ? "True / False" : "Multiple Choice"}
+                    </span>
+                  </div>
+
+                  {/* Question text with math rendering */}
+                  <div style={{ fontWeight: 500, color: "#0F172A", fontSize: 14, lineHeight: 1.5, marginBottom: 8 }}>
+                    <MathText text={q.question_text} />
+                  </div>
+
+                  {/* Options preview */}
+                  {q.question_type === "multiple_choice" && q.options && (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                      {q.options.map((opt, oi) => {
+                        const label = ["A", "B", "C", "D"][oi];
+                        const isCorrect = q.correct_answer === label;
+                        return (
+                          <span key={oi} style={{
+                            fontSize: 12, padding: "3px 10px", borderRadius: 20,
+                            background: isCorrect ? "#D1FAE5" : "#F1F5F9",
+                            color: isCorrect ? "#065F46" : "#475569",
+                            fontWeight: isCorrect ? 700 : 400,
+                            border: isCorrect ? "1.5px solid #10B981" : "1.5px solid transparent"
+                          }}>
+                            {opt} {isCorrect && "✓"}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {q.question_type === "true_false" && (
+                    <div style={{ display: "flex", gap: 6 }}>
+                      {["true", "false"].map(v => (
+                        <span key={v} style={{
+                          fontSize: 12, padding: "3px 12px", borderRadius: 20, textTransform: "capitalize",
+                          background: q.correct_answer === v ? "#D1FAE5" : "#F1F5F9",
+                          color: q.correct_answer === v ? "#065F46" : "#475569",
+                          fontWeight: q.correct_answer === v ? 700 : 400,
+                          border: q.correct_answer === v ? "1.5px solid #10B981" : "1.5px solid transparent"
+                        }}>
+                          {v} {q.correct_answer === v && "✓"}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Explanation preview */}
+                  {q.explanation && (
+                    <div style={{ marginTop: 6, fontSize: 12, color: "#92400E", background: "#FEF3C7", borderRadius: 6, padding: "4px 10px", display: "inline-block" }}>
+                      💡 <MathText text={q.explanation} />
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Footer buttons */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ fontSize: 13, color: "#64748B" }}>
+          {selected.size === 0
+            ? "Click questions to select them"
+            : `${selected.size} question${selected.size !== 1 ? "s" : ""} ready to add`}
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button className="btn2" onClick={close}>Cancel</button>
+          <button
+            className="btn1"
+            onClick={addSelected}
+            disabled={selected.size === 0}
+            style={{ opacity: selected.size === 0 ? 0.5 : 1 }}
+          >
+            Add {selected.size > 0 ? selected.size : ""} Question{selected.size !== 1 ? "s" : ""} →
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 
 // ── FIX 1 & 2: Quiz Interface (Math rendering + Explanations) ─────────────────
 function QuizInterface({ assignment, student, session, onClose }) {
