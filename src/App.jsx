@@ -65,6 +65,98 @@ async function saveSubmission(studentId, assignmentId, data) {
   if (!res.ok) { const t = await res.text(); let m; try { m = JSON.parse(t).message; } catch { m = t; } throw new Error(m); }
   return res.json();
 }
+// Shuffle an array (Fisher-Yates)
+function shuffleArray(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// Get attempt number for a student on a topic (returns 1 if first time)
+async function getAttemptNumber(studentId, grade, subject, topic) {
+  try {
+    const rows = await db(
+      "student_progress", "GET",
+      `student_id=eq.${studentId}&grade=eq.${encodeURIComponent(grade)}&subject=eq.${encodeURIComponent(subject)}&topic=eq.${encodeURIComponent(topic)}`
+    );
+    return rows && rows.length > 0 ? rows[0].attempt_number : 1;
+  } catch (e) {
+    return 1; // default to first attempt
+  }
+}
+
+// Save/update progress after a topic attempt
+async function saveTopicProgress(studentId, grade, subject, topic, attemptNumber, score, percentage) {
+  const url = `${SB_URL}/rest/v1/student_progress?on_conflict=student_id,grade,subject,topic`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      apikey: SB_KEY, Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation,resolution=merge-duplicates"
+    },
+    body: JSON.stringify({
+      student_id: studentId,
+      grade, subject, topic,
+      attempt_number: attemptNumber + 1, // increment for next time
+      last_score: score,
+      last_percentage: percentage,
+      last_attempted_at: new Date().toISOString()
+    })
+  });
+  if (!res.ok) console.error("Failed to save progress:", await res.text());
+}
+
+// Read the highest set_number that exists in question_library for this topic.
+// Makes the "how many sets before we shuffle" behavior dynamic instead of
+// hardcoded — upload Set 4, 5, etc. and it's picked up automatically.
+async function getMaxSetNumber(grade, subject, topic) {
+  try {
+    const rows = await db(
+      "question_library", "GET",
+      `grade=eq.${encodeURIComponent(grade)}&subject=eq.${encodeURIComponent(subject)}&topic=eq.${encodeURIComponent(topic)}&select=set_number&order=set_number.desc&limit=1`
+    );
+    return rows && rows.length > 0 ? (rows[0].set_number || 1) : 1;
+  } catch (e) {
+    console.error("getMaxSetNumber error:", e);
+    return 1; // safe fallback — behaves like a single-set topic
+  }
+}
+
+// THE KEY FUNCTION: Get the right 10 questions for this student's attempt
+async function getQuestionsForStudent(grade, subject, topic, studentId) {
+  try {
+    const [attemptNum, maxSet] = await Promise.all([
+      getAttemptNumber(studentId, grade, subject, topic),
+      getMaxSetNumber(grade, subject, topic)
+    ]);
+
+    if (attemptNum <= maxSet) {
+      // Still within uploaded sets: give Set 1, Set 2, ... Set maxSet in order
+      const rows = await db(
+        "question_library", "GET",
+        `grade=eq.${encodeURIComponent(grade)}&subject=eq.${encodeURIComponent(subject)}&topic=eq.${encodeURIComponent(topic)}&set_number=eq.${attemptNum}&order=created_at.asc`
+      );
+      return { questions: rows || [], attemptNumber: attemptNum, maxSet };
+    } else {
+      // Beyond the last uploaded set: shuffle 10 random questions from ALL sets for this topic
+      const allRows = await db(
+        "question_library", "GET",
+        `grade=eq.${encodeURIComponent(grade)}&subject=eq.${encodeURIComponent(subject)}&topic=eq.${encodeURIComponent(topic)}&order=created_at.asc`
+      );
+      const shuffled = shuffleArray(allRows || []);
+      return { questions: shuffled.slice(0, 10), attemptNumber: attemptNum, maxSet };
+    }
+  } catch (e) {
+    console.error("getQuestionsForStudent error:", e);
+    return { questions: [], attemptNumber: 1, maxSet: 1 };
+  }
+}
+
+
 async function uploadFile(file, userId, assignmentId) {
   const ext = file.name.split(".").pop();
   const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
@@ -1079,6 +1171,9 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
   const [step, setStep] = useState(1);
   const [title, setTitle] = useState("");
   const [subject, setSubject] = useState(SUBJECTS[0]);
+  const [topic, setTopic] = useState("");
+  const [topicOptions, setTopicOptions] = useState([]);
+  const [loadingTopics, setLoadingTopics] = useState(false);
   const [classId, setClassId] = useState(data.classId || classes[0]?.id || "");
   const [dueDate, setDueDate] = useState("");
   const [desc, setDesc] = useState("");
@@ -1094,6 +1189,28 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
   const selClass = classes.find(c => c.id === classId);
   const classStudents = students.filter(s => selClass?.students.includes(s.id));
 
+  // Load topics that actually exist in question_library for this grade+subject,
+  // so teachers can't typo a topic name that has no questions behind it.
+  useEffect(() => {
+    if (!selClass?.grade || !subject) { setTopicOptions([]); return; }
+    setLoadingTopics(true);
+    setTopic("");
+    (async () => {
+      try {
+        const rows = await db(
+          "question_library", "GET",
+          `grade=eq.${encodeURIComponent(selClass.grade)}&subject=eq.${encodeURIComponent(subject)}&select=topic`
+        );
+        setTopicOptions([...new Set((rows || []).map(r => r.topic))].sort());
+      } catch (e) {
+        console.error("Load topics error:", e);
+        setTopicOptions([]);
+      } finally {
+        setLoadingTopics(false);
+      }
+    })();
+  }, [selClass?.grade, subject]);
+
   const handleFile = (e) => {
     const f = e.target.files[0];
     if (f) { setFile(f); setFileName(f.name); }
@@ -1108,6 +1225,7 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
       const [newA] = await db("assignments", "POST", "", {
         teacher_id: userId, class_id: classId, subject,
         title: title.trim(), description: desc,
+        topic: topic.trim() || null,
         due_date: dueDate || null,
         file_name: fileName || null,
         status: "active"
@@ -1197,6 +1315,13 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
               {(selClass?.subjects.length ? selClass.subjects : SUBJECTS).map(s => <option key={s}>{s}</option>)}
             </select>
           </div>
+        </div>
+        <div style={{ marginBottom: 16 }}>
+          <label className="lbl">Topic <span style={{ color: "#94A3B8", fontWeight: 400, textTransform: "none" }}>(optional — links to your question library so students can retake with a new set)</span></label>
+          <select className="sel" value={topic} onChange={e => setTopic(e.target.value)} disabled={loadingTopics || topicOptions.length === 0}>
+            <option value="">{loadingTopics ? "Loading topics…" : topicOptions.length === 0 ? "No topics found for this grade/subject" : "None (no retake)"}</option>
+            {topicOptions.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
         </div>
         <div style={{ marginBottom: 16 }}>
           <label className="lbl">Due Date</label>
@@ -1289,6 +1414,7 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
   // Details state
   const [title, setTitle] = useState(a.title);
   const [subject, setSubject] = useState(a.subject);
+  const [topic, setTopic] = useState(a.topic || "");
   const [dueDate, setDueDate] = useState(a.due_date || "");
   const [desc, setDesc] = useState(a.description || "");
 
@@ -1309,6 +1435,31 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
   const classStudents = students.filter(s => selClass?.students.includes(s.id));
   const [assignedTo, setAssignedTo] = useState(new Set(a.assignedTo || []));
 
+  const [topicOptions, setTopicOptions] = useState([]);
+  const [loadingTopics, setLoadingTopics] = useState(false);
+
+  // Load topics that actually exist in question_library for this grade+subject.
+  // Doesn't force-clear `topic` on load so the assignment's existing topic stays
+  // selected if it's still valid for the (possibly changed) subject.
+  useEffect(() => {
+    if (!selClass?.grade || !subject) { setTopicOptions([]); return; }
+    setLoadingTopics(true);
+    (async () => {
+      try {
+        const rows = await db(
+          "question_library", "GET",
+          `grade=eq.${encodeURIComponent(selClass.grade)}&subject=eq.${encodeURIComponent(subject)}&select=topic`
+        );
+        setTopicOptions([...new Set((rows || []).map(r => r.topic))].sort());
+      } catch (e) {
+        console.error("Load topics error:", e);
+        setTopicOptions([]);
+      } finally {
+        setLoadingTopics(false);
+      }
+    })();
+  }, [selClass?.grade, subject]);
+
   const [step, setStep] = useState(1);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
@@ -1326,6 +1477,7 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
       await db("assignments", "PATCH", `id=eq.${a.id}`, {
         title: title.trim(),
         subject,
+        topic: topic.trim() || null,
         due_date: dueDate || null,
         description: desc
       });
@@ -1415,6 +1567,13 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
             <label className="lbl">Due Date</label>
             <input className="inp" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} />
           </div>
+        </div>
+        <div style={{ marginBottom: 16 }}>
+          <label className="lbl">Topic <span style={{ color: "#94A3B8", fontWeight: 400, textTransform: "none" }}>(optional — links to your question library so students can retake with a new set)</span></label>
+          <select className="sel" value={topic} onChange={e => setTopic(e.target.value)} disabled={loadingTopics || topicOptions.length === 0}>
+            <option value="">{loadingTopics ? "Loading topics…" : topicOptions.length === 0 ? "No topics found for this grade/subject" : "None (no retake)"}</option>
+            {topicOptions.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
         </div>
         <div style={{ marginBottom: 20 }}>
           <label className="lbl">Instructions</label>
@@ -1543,6 +1702,12 @@ function StudentApp({ initialData, session, onLogout }) {
   const reload = async () => { setLoading(true); try { const d = await loadStudentData(session.user.id); setData(d); } catch (e) { console.error(e); } finally { setLoading(false); } };
   const openQuiz = (assignment) => { setActiveAssignment(assignment); setView("quiz"); };
   const closeQuiz = () => { setView("home"); setActiveAssignment(null); reload(); };
+  const [practiceGrade, setPracticeGrade] = useState(data?.student?.grade || "Grade 4");
+const [practiceSubject, setPracticeSubject] = useState("Math");
+const [practiceTopics, setPracticeTopics] = useState([]);
+const [practiceTopic, setPracticeTopic] = useState(null); // { grade, subject, topic }
+const [loadingTopics, setLoadingTopics] = useState(false);
+
   if (view === "quiz" && activeAssignment) return <QuizInterface assignment={activeAssignment} student={data.student} session={session} onClose={closeQuiz} />;
   if (!data?.student) {
     return (
@@ -1919,6 +2084,227 @@ function LibraryBrowser({ onAdd, close }) {
   );
 }
 
+function TopicPracticeModal({ grade, subject, topic, student, onClose }) {
+  const [questions, setQuestions] = useState([]);
+  const [attemptNumber, setAttemptNumber] = useState(1);
+  const [maxSet, setMaxSet] = useState(3);
+  const [answers, setAnswers] = useState({});
+  const [submitted, setSubmitted] = useState(false);
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [savingQ, setSavingQ] = useState(null);
+
+  // Load questions on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const { questions: qs, attemptNumber: att, maxSet: ms } = await getQuestionsForStudent(
+          grade, subject, topic, student.studentId
+        );
+        setQuestions(qs);
+        setAttemptNumber(att);
+        setMaxSet(ms || 3);
+      } catch (e) {
+        console.error(e);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  const setLabels = ["", "Set A — Foundational", "Set B — Applied", "Set C — Challenge"];
+  const setLabel = (n) => {
+    if (n <= maxSet && setLabels[n]) return setLabels[n];
+    if (n <= maxSet) return `Set ${n}`;
+    return `Attempt ${n} — Random Mix`;
+  };
+
+  const selectAnswer = (qId, answer) => {
+    if (submitted) return;
+    setAnswers(p => ({ ...p, [qId]: answer }));
+  };
+
+  const submit = async () => {
+    if (!confirm("Submit your answers? You cannot change them after submitting.")) return;
+    setSubmitting(true);
+    try {
+      let score = 0;
+      const graded = questions.map(q => {
+        const selected = answers[q.id] || null;
+        const correct = selected?.toLowerCase() === q.correct_answer?.toLowerCase();
+        if (correct) score++;
+        return { ...q, selected, correct };
+      });
+      const pct = Math.round((score / questions.length) * 100);
+
+      // Save progress (increments attempt count for next time)
+      await saveTopicProgress(
+        student.studentId, grade, subject, topic,
+        attemptNumber, score, pct
+      );
+
+      setResult({ score, total: questions.length, pct, graded });
+      setSubmitted(true);
+    } catch (e) {
+      alert("Error submitting: " + e.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const answered = Object.keys(answers).filter(k => answers[k]).length;
+
+  // ── Header ──
+  const header = (
+    <div style={{ background: "linear-gradient(135deg,#0F172A,#1E1B4B)", padding: "14px 24px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 10 }}>
+      <div>
+        <div style={{ color: "#fff", fontFamily: "Outfit,sans-serif", fontWeight: 800, fontSize: 16 }}>{topic}</div>
+        <div style={{ color: "#818CF8", fontSize: 12 }}>{grade} · {subject} · {setLabel(attemptNumber)}</div>
+      </div>
+      <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+        {!submitted && <div style={{ color: "#94A3B8", fontSize: 13 }}>{answered}/{questions.length} answered</div>}
+        <button onClick={onClose} style={{ background: "rgba(255,255,255,0.1)", color: "#E2E8F0", border: "none", padding: "6px 12px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 600, fontFamily: "inherit" }}>← Back</button>
+      </div>
+    </div>
+  );
+
+  if (loading) return (
+    <div style={{ fontFamily: "'Inter',sans-serif", minHeight: "100vh", background: "#F0F2F8" }}>
+      <style>{CSS}</style>
+      {header}
+      <Loader text="Loading questions…" />
+    </div>
+  );
+
+  if (questions.length === 0) return (
+    <div style={{ fontFamily: "'Inter',sans-serif", minHeight: "100vh", background: "#F0F2F8" }}>
+      <style>{CSS}</style>
+      {header}
+      <div style={{ textAlign: "center", padding: 48, color: "#94A3B8" }}>
+        <div style={{ fontSize: 36, marginBottom: 12 }}>📭</div>
+        No questions found for this topic yet.
+        <div style={{ marginTop: 16 }}>
+          <button className="btn2" onClick={onClose}>← Back</button>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{ fontFamily: "'Inter',sans-serif", minHeight: "100vh", background: "#F0F2F8" }}>
+      <style>{CSS}</style>
+      {header}
+
+      {/* Progress bar */}
+      {!submitted && (
+        <div style={{ height: 4, background: "#1E293B" }}>
+          <div style={{ height: "100%", background: "#4F46E5", transition: "width 0.3s", width: `${(answered / questions.length) * 100}%` }} />
+        </div>
+      )}
+
+      <div style={{ maxWidth: 720, margin: "0 auto", padding: "28px 20px" }}>
+
+        {/* Score banner */}
+        {submitted && result && (
+          <div className="fade" style={{
+            background: result.pct >= 70 ? "linear-gradient(135deg,#059669,#047857)" : result.pct >= 50 ? "linear-gradient(135deg,#D97706,#B45309)" : "linear-gradient(135deg,#DC2626,#B91C1C)",
+            borderRadius: 20, padding: 28, marginBottom: 28, textAlign: "center", color: "#fff"
+          }}>
+            <div style={{ fontSize: 44, marginBottom: 6 }}>{result.pct >= 70 ? "🏆" : result.pct >= 50 ? "👍" : "📚"}</div>
+            <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 44, fontWeight: 800 }}>{result.pct}%</div>
+            <div style={{ fontSize: 17, marginTop: 4, opacity: 0.9 }}>{result.score} of {result.total} correct</div>
+            <div style={{ fontSize: 13, marginTop: 8, opacity: 0.8 }}>
+              {result.pct >= 80 ? "Excellent! Ready to move on! 🌟" :
+               result.pct >= 60 ? "Good work! Try the next set to improve!" :
+               "Keep practicing — you're getting there! 💪"}
+            </div>
+            <div style={{ marginTop: 12, fontSize: 12, background: "rgba(255,255,255,0.15)", borderRadius: 8, padding: "6px 14px", display: "inline-block" }}>
+              Next attempt: {setLabel(attemptNumber + 1)}
+            </div>
+          </div>
+        )}
+
+        {/* Questions */}
+        {(submitted ? result.graded : questions).map((q, i) => {
+          const selected = submitted ? q.selected : answers[q.id];
+          const opts = q.question_type === "true_false" ? ["true", "false"] : (q.options || []);
+          const optLabels = q.question_type === "multiple_choice" ? ["A", "B", "C", "D"] : null;
+          const isCorrect = submitted ? q.correct : null;
+
+          return (
+            <div key={q.id || i} className={`qcard fade${selected ? " answered" : ""}`}>
+              <div style={{ display: "flex", gap: 10, alignItems: "flex-start", marginBottom: 12 }}>
+                <div style={{ width: 28, height: 28, borderRadius: "50%", background: submitted ? (isCorrect ? "#10B981" : selected ? "#EF4444" : "#94A3B8") : "#4F46E5", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 12, flexShrink: 0 }}>
+                  {submitted ? (isCorrect ? "✓" : selected ? "✗" : i + 1) : i + 1}
+                </div>
+                <div style={{ fontWeight: 600, color: "#0F172A", fontSize: 15, lineHeight: 1.5, flex: 1 }}>
+                  <MathText text={q.question_text} />
+                </div>
+                {submitted && <span style={{ fontSize: 18 }}>{isCorrect ? "✅" : selected ? "❌" : "⬜"}</span>}
+              </div>
+
+              <div style={{ paddingLeft: 38 }}>
+                {opts.map((opt, oi) => {
+                  const label = optLabels ? optLabels[oi] : null;
+                  const val = optLabels ? label : opt;
+                  const isSelected = selected === val;
+                  const isCorrectOpt = q.correct_answer?.toLowerCase() === val?.toLowerCase();
+                  let cls = "opt";
+                  if (submitted) { if (isCorrectOpt) cls += " correct"; else if (isSelected && !isCorrectOpt) cls += " wrong"; }
+                  else if (isSelected) cls += " selected";
+
+                  return (
+                    <div key={oi} className={cls} onClick={() => !submitted && selectAnswer(q.id, val)}>
+                      {label && (
+                        <span style={{ width: 24, height: 24, borderRadius: "50%", background: submitted ? (isCorrectOpt ? "#10B981" : isSelected ? "#EF4444" : "#E2E8F0") : (isSelected ? "#4F46E5" : "#E2E8F0"), color: submitted ? (isCorrectOpt || isSelected ? "#fff" : "#64748B") : (isSelected ? "#fff" : "#64748B"), display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 11, flexShrink: 0 }}>{label}</span>
+                      )}
+                      <span style={{ fontWeight: 500, fontSize: 14, color: "#0F172A", textTransform: "capitalize" }}>
+                        <MathText text={opt} />
+                      </span>
+                      {submitted && isCorrectOpt && <span style={{ marginLeft: "auto", fontSize: 11, color: "#059669", fontWeight: 700 }}>✓ Correct</span>}
+                    </div>
+                  );
+                })}
+
+                {submitted && q.explanation && (
+                  <div className="explanation-box">
+                    <strong>💡 Explanation:</strong> <MathText text={q.explanation} />
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+
+        {/* Submit / Back */}
+        {!submitted ? (
+          <div style={{ textAlign: "center", marginTop: 24 }}>
+            <button className="btn1" onClick={submit} disabled={submitting || answered === 0} style={{ padding: "14px 40px", fontSize: 16 }}>
+              {submitting ? "Grading…" : `Submit (${answered}/${questions.length} answered)`}
+            </button>
+            {answered < questions.length && (
+              <div style={{ fontSize: 12, color: "#94A3B8", marginTop: 8 }}>Unanswered questions = incorrect</div>
+            )}
+          </div>
+        ) : (
+          <div style={{ textAlign: "center", marginTop: 24, display: "flex", gap: 12, justifyContent: "center" }}>
+            <button className="btn2" onClick={onClose}>← Back to Topics</button>
+            <button className="btn1" onClick={() => {
+              // Retry — reload with new attempt number
+              setLoading(true); setSubmitted(false); setAnswers({}); setResult(null);
+              getQuestionsForStudent(grade, subject, topic, student.studentId).then(({ questions: qs, attemptNumber: att, maxSet: ms }) => {
+                setQuestions(qs); setAttemptNumber(att); setMaxSet(ms || 3); setLoading(false);
+              });
+            }}>
+              Try Again →
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 // ── FIX 1 & 2: Quiz Interface (Math rendering + Explanations) ─────────────────
 function QuizInterface({ assignment, student, session, onClose }) {
@@ -1929,7 +2315,24 @@ function QuizInterface({ assignment, student, session, onClose }) {
   const [submitted, setSubmitted] = useState(false);
   const [result, setResult] = useState(null);
   const [savingQ, setSavingQ] = useState(null);
+  // Retake support: once a student is on a retake, questions come from the
+  // shared question_library/topic system (same one TopicPracticeModal uses)
+  // instead of the per-assignment "questions" table.
+  const [retakeMode, setRetakeMode] = useState(false);
+  const [retakeAttempt, setRetakeAttempt] = useState(1);
+  const [retaking, setRetaking] = useState(false);
   const alreadySubmitted = assignment.submission?.status === "submitted";
+
+  const grade = student.grade;
+  const subject = assignment.subject;
+  const topic = assignment.topic;
+
+  // Auto-graded = every question is multiple choice or true/false (i.e. gradable by the system)
+  const isAutoGraded = questions.length > 0 && questions.every(
+    q => q.question_type === "multiple_choice" || q.question_type === "true_false"
+  );
+  // Retake only makes sense if the assignment is linked to a topic in the question library
+  const canRetake = isAutoGraded && !!topic;
 
   useEffect(() => {
     (async () => {
@@ -1954,6 +2357,7 @@ function QuizInterface({ assignment, student, session, onClose }) {
   // FIX 1: use saveAnswer() with correct on_conflict
   const selectAnswer = async (questionId, answer) => {
     setAnswers(p => ({ ...p, [questionId]: answer }));
+    if (retakeMode) return; // retake questions aren't tied to this assignment_id — just track locally
     setSavingQ(questionId);
     try {
       await saveAnswer(student.studentId, assignment.id, questionId, answer);
@@ -1971,31 +2375,62 @@ function QuizInterface({ assignment, student, session, onClose }) {
     setSubmitting(true);
     try {
       let score = 0;
-      // Save all answers with is_correct flag
-      await Promise.all(questions.map(q => {
-        const selected = answers[q.id];
-        const correct = selected?.toLowerCase() === q.correct_answer?.toLowerCase();
-        if (correct) score++;
-        return saveAnswer(student.studentId, assignment.id, q.id, selected || null, correct);
-      }));
-      // Save final submission
       const total = questions.length;
-      const pct = total > 0 ? Math.round((score / total) * 100) : 0;
-      await saveSubmission(student.studentId, assignment.id, {
-        status: "submitted", score, total_points: total,
-        percentage: pct, submitted_at: new Date().toISOString()
-      });
-      setResult({ score, total_points: total, percentage: pct });
+
+      if (retakeMode) {
+        // Grade locally and record progress against student_progress (topic-based),
+        // rather than the per-assignment questions/submissions tables.
+        questions.forEach(q => {
+          const selected = answers[q.id];
+          if (selected?.toLowerCase() === q.correct_answer?.toLowerCase()) score++;
+        });
+        const pct = total > 0 ? Math.round((score / total) * 100) : 0;
+        await saveTopicProgress(student.studentId, grade, subject, topic, retakeAttempt, score, pct);
+        setResult({ score, total_points: total, percentage: pct });
+      } else {
+        // Save all answers with is_correct flag
+        await Promise.all(questions.map(q => {
+          const selected = answers[q.id];
+          const correct = selected?.toLowerCase() === q.correct_answer?.toLowerCase();
+          if (correct) score++;
+          return saveAnswer(student.studentId, assignment.id, q.id, selected || null, correct);
+        }));
+        // Save final submission
+        const pct = total > 0 ? Math.round((score / total) * 100) : 0;
+        await saveSubmission(student.studentId, assignment.id, {
+          status: "submitted", score, total_points: total,
+          percentage: pct, submitted_at: new Date().toISOString()
+        });
+        setResult({ score, total_points: total, percentage: pct });
+      }
       setSubmitted(true);
     } catch (e) { alert("Error submitting: " + e.message); }
     finally { setSubmitting(false); }
+  };
+
+  // Retake: pull the next set (or a shuffled mix once all sets are exhausted) for this topic
+  const retake = async () => {
+    setRetaking(true);
+    try {
+      const { questions: qs, attemptNumber: att } = await getQuestionsForStudent(grade, subject, topic, student.studentId);
+      setQuestions(qs);
+      setAnswers({});
+      setResult(null);
+      setSubmitted(false);
+      setRetakeMode(true);
+      setRetakeAttempt(att);
+    } catch (e) {
+      alert("Couldn't load a new set: " + e.message);
+    } finally {
+      setRetaking(false);
+    }
   };
 
   const answered = Object.keys(answers).filter(k => answers[k]).length;
   const header = (
     <div style={{ background: "linear-gradient(135deg,#0F172A,#1E1B4B)", padding: "16px 32px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 10 }}>
       <div>
-        <div style={{ fontFamily: "Outfit,sans-serif", color: "#fff", fontWeight: 800, fontSize: 17 }}>{assignment.title}</div>
+        <div style={{ fontFamily: "Outfit,sans-serif", color: "#fff", fontWeight: 800, fontSize: 17 }}>{assignment.title}{retakeMode ? ` · Retake ${retakeAttempt}` : ""}</div>
         <div style={{ color: "#64748B", fontSize: 12 }}>{assignment.subject}{questions.length > 0 ? ` · ${questions.length} questions` : ""}</div>
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
@@ -2174,7 +2609,19 @@ function QuizInterface({ assignment, student, session, onClose }) {
         )}
         {submitted && (
           <div style={{ textAlign: "center", marginTop: 24 }}>
-            <button className="btn1" onClick={onClose} style={{ padding: "12px 32px" }}>← Back to My Assignments</button>
+            <div style={{ display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap" }}>
+              <button className="btn2" onClick={onClose} style={{ padding: "12px 32px" }}>← Back to My Assignments</button>
+              {canRetake && (
+                <button className="btn1" onClick={retake} disabled={retaking} style={{ padding: "12px 32px" }}>
+                  {retaking ? "Loading new set…" : "Retake Assignment →"}
+                </button>
+              )}
+            </div>
+            {canRetake && (
+              <div style={{ fontSize: 12, color: "#94A3B8", marginTop: 10 }}>
+                This is auto-graded, so you can retake it with a new set of questions any time.
+              </div>
+            )}
           </div>
         )}
       </div>
