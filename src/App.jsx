@@ -250,18 +250,19 @@ async function loadTeacherData(uid) {
   ]);
   const cids = classes.map(c => c.id).join(",");
   const aids = assignments.map(a => a.id).join(",");
-  const [cs, as2, questions, accts, subs, retakeSessions] = await Promise.all([
+  const [cs, as2, questions, accts, subs, retakeSessions, studentAnswers] = await Promise.all([
     cids ? db("class_students", "GET", `class_id=in.(${cids})`) : Promise.resolve([]),
     aids ? db("assignment_students", "GET", `assignment_id=in.(${aids})`) : Promise.resolve([]),
     aids ? db("questions", "GET", `assignment_id=in.(${aids})&order=order_index.asc`) : Promise.resolve([]),
     db("student_accounts", "GET", `select=student_id,invite_token,invite_accepted,auth_user_id,student_name`),
     aids ? db("submissions", "GET", `assignment_id=in.(${aids})`) : Promise.resolve([]),
-    aids ? db("retake_sessions", "GET", `assignment_id=in.(${aids})&order=attempt_number.asc`) : Promise.resolve([])
+    aids ? db("retake_sessions", "GET", `assignment_id=in.(${aids})&order=attempt_number.asc`) : Promise.resolve([]),
+    aids ? db("student_answers", "GET", `assignment_id=in.(${aids})`) : Promise.resolve([])
   ]);
   return {
     classes: classes.map(c => ({ ...c, subjects: c.subjects || [], students: cs.filter(x => x.class_id === c.id).map(x => x.student_id) })),
     students: students.map(s => ({ ...s, classes: cs.filter(x => x.student_id === s.id).map(x => x.class_id), account: accts.find(a => a.student_id === s.id) })),
-    assignments: assignments.map(a => ({ ...a, assignedTo: as2.filter(x => x.assignment_id === a.id).map(x => x.student_id), questions: questions.filter(q => q.assignment_id === a.id), submissions: subs.filter(s => s.assignment_id === a.id), retakeSessions: retakeSessions.filter(rs => rs.assignment_id === a.id) }))
+    assignments: assignments.map(a => ({ ...a, assignedTo: as2.filter(x => x.assignment_id === a.id).map(x => x.student_id), questions: questions.filter(q => q.assignment_id === a.id), submissions: subs.filter(s => s.assignment_id === a.id), retakeSessions: retakeSessions.filter(rs => rs.assignment_id === a.id), studentAnswers: studentAnswers.filter(sa => sa.assignment_id === a.id) }))
   };
 }
 
@@ -1870,23 +1871,57 @@ function ViewAssignmentModal({ assignment: a, students, classes, close }) {
 }
 
 function AssignmentResultsModal({ assignment: a, students, close }) {
+  const [expandedSub, setExpandedSub] = useState(null); // student_id whose original submission is expanded
+  const [expandedRetake, setExpandedRetake] = useState(null); // retake_session id that's expanded
   if (!a) return null;
   const subs = a.submissions || [];
   const retakes = a.retakeSessions || [];
+  const studentAnswers = a.studentAnswers || [];
   // Union of every student who has either an original submission or at least one retake attempt
   const studentIds = [...new Set([...subs.map(s => s.student_id), ...retakes.map(r => r.student_id)])];
+
+  const QuestionBreakdown = ({ questions, getSelected }) => (
+    <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+      {(questions || []).map((q, i) => {
+        const selected = getSelected(q);
+        const correct = selected?.toLowerCase() === q.correct_answer?.toLowerCase();
+        return (
+          <div key={q.id || i} style={{ padding: "8px 10px", background: correct ? "#F0FDF4" : "#FEF2F2", borderRadius: 8, fontSize: 12.5, border: `1px solid ${correct ? "#BBF7D0" : "#FECACA"}` }}>
+            <div style={{ display: "flex", gap: 6, alignItems: "flex-start" }}>
+              <span>{correct ? "✅" : "❌"}</span>
+              <div style={{ flex: 1 }}>
+                <div style={{ color: "#0F172A", fontWeight: 500 }}><MathText text={q.question_text} /></div>
+                <div style={{ color: "#64748B", marginTop: 2 }}>
+                  Student answered: <strong style={{ color: correct ? "#059669" : "#DC2626" }}>{selected || "(no answer)"}</strong>
+                  {!correct && <> · Correct: <strong style={{ color: "#059669" }}>{q.correct_answer}</strong></>}
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+
   return (<div><div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}><div><div style={{ fontFamily: "Outfit,sans-serif", fontSize: 20, fontWeight: 800, color: "#0F172A" }}>{a.title} — Results</div><div style={{ color: "#64748B", fontSize: 13 }}>{a.questions?.length || 0} questions · {subs.length} submissions</div></div><button style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: "#94A3B8" }} onClick={close}>✕</button></div>{studentIds.length === 0 && <div style={{ textAlign: "center", padding: 32, color: "#94A3B8" }}>No submissions yet.</div>}{studentIds.map(sid => {
     const st = students.find(s => s.id === sid);
     const sub = subs.find(s => s.student_id === sid);
     const myRetakes = retakes.filter(r => r.student_id === sid).sort((x, y) => x.attempt_number - y.attempt_number);
     const pct = sub?.percentage ?? 0;
+    const subExpanded = expandedSub === sid;
     return (
       <div key={sid} style={{ padding: "14px 0", borderBottom: "1px solid #F1F5F9" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+        <div
+          style={{ display: "flex", alignItems: "center", gap: 14, cursor: sub ? "pointer" : "default" }}
+          onClick={() => sub && setExpandedSub(subExpanded ? null : sid)}
+        >
           <div className="av" style={{ background: getAC(sid) }}>{st?.avatar || st?.name?.[0] || "?"}</div>
           <div style={{ flex: 1 }}>
             <div style={{ fontWeight: 600, fontSize: 14, color: "#0F172A" }}>{st?.name || "Unknown"}</div>
-            <div style={{ fontSize: 12, color: "#64748B" }}>{sub ? `Original · ${new Date(sub.submitted_at).toLocaleDateString()}` : "No original submission"}</div>
+            <div style={{ fontSize: 12, color: "#64748B" }}>
+              {sub ? `Original · ${new Date(sub.submitted_at).toLocaleDateString()}` : "No original submission"}
+              {sub && <span style={{ color: "#4F46E5", marginLeft: 6 }}>{subExpanded ? "▲ Hide answers" : "▼ View answers"}</span>}
+            </div>
           </div>
           {sub && (
             <div style={{ textAlign: "right" }}>
@@ -1895,22 +1930,47 @@ function AssignmentResultsModal({ assignment: a, students, close }) {
             </div>
           )}
         </div>
+
+        {subExpanded && sub && (
+          <div style={{ marginLeft: 54 }}>
+            <QuestionBreakdown
+              questions={a.questions}
+              getSelected={q => studentAnswers.find(sa => sa.student_id === sid && sa.question_id === q.id)?.selected_answer}
+            />
+          </div>
+        )}
+
         {myRetakes.length > 0 && (
           <div style={{ marginLeft: 54, marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
-            {myRetakes.map(r => (
-              <div key={r.id} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, background: "#F8FAFF", borderRadius: 8, padding: "6px 10px" }}>
-                <span style={{ fontWeight: 600, color: "#4F46E5" }}>Retake {r.attempt_number}</span>
-                {r.status === "submitted" ? (
-                  <>
-                    <span style={{ fontWeight: 700, color: (r.percentage || 0) >= 70 ? "#059669" : (r.percentage || 0) >= 50 ? "#D97706" : "#DC2626" }}>{r.percentage}%</span>
-                    <span style={{ color: "#64748B" }}>{r.score}/{r.total_points} pts</span>
-                    <span style={{ color: "#94A3B8", marginLeft: "auto" }}>{new Date(r.updated_at).toLocaleDateString()}</span>
-                  </>
-                ) : (
-                  <span style={{ color: "#D97706", fontWeight: 600 }}>In progress…</span>
-                )}
-              </div>
-            ))}
+            {myRetakes.map(r => {
+              const rExpanded = expandedRetake === r.id;
+              return (
+                <div key={r.id}>
+                  <div
+                    style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, background: "#F8FAFF", borderRadius: 8, padding: "6px 10px", cursor: r.status === "submitted" ? "pointer" : "default" }}
+                    onClick={() => r.status === "submitted" && setExpandedRetake(rExpanded ? null : r.id)}
+                  >
+                    <span style={{ fontWeight: 600, color: "#4F46E5" }}>Retake {r.attempt_number}</span>
+                    {r.status === "submitted" ? (
+                      <>
+                        <span style={{ fontWeight: 700, color: (r.percentage || 0) >= 70 ? "#059669" : (r.percentage || 0) >= 50 ? "#D97706" : "#DC2626" }}>{r.percentage}%</span>
+                        <span style={{ color: "#64748B" }}>{r.score}/{r.total_points} pts</span>
+                        <span style={{ color: "#94A3B8" }}>{new Date(r.updated_at).toLocaleDateString()}</span>
+                        <span style={{ color: "#4F46E5", marginLeft: "auto" }}>{rExpanded ? "▲ Hide" : "▼ View answers"}</span>
+                      </>
+                    ) : (
+                      <span style={{ color: "#D97706", fontWeight: 600 }}>In progress…</span>
+                    )}
+                  </div>
+                  {rExpanded && (
+                    <QuestionBreakdown
+                      questions={r.questions}
+                      getSelected={q => (r.answers || {})[q.id]}
+                    />
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
       </div>
