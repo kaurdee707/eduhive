@@ -88,6 +88,21 @@ async function getAttemptNumber(studentId, grade, subject, topic) {
   }
 }
 
+// Save/update a student's retake session (in-progress or submitted) so it survives navigating away
+async function saveRetakeSession(studentId, assignmentId, data) {
+  const url = `${SB_URL}/rest/v1/retake_sessions?on_conflict=student_id,assignment_id,attempt_number`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      apikey: SB_KEY, Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation,resolution=merge-duplicates"
+    },
+    body: JSON.stringify({ student_id: studentId, assignment_id: assignmentId, updated_at: new Date().toISOString(), ...data })
+  });
+  if (!res.ok) console.error("Failed to save retake session:", await res.text());
+}
+
 // Save/update progress after a topic attempt
 async function saveTopicProgress(studentId, grade, subject, topic, attemptNumber, score, percentage) {
   const url = `${SB_URL}/rest/v1/student_progress?on_conflict=student_id,grade,subject,topic`;
@@ -108,6 +123,13 @@ async function saveTopicProgress(studentId, grade, subject, topic, attemptNumber
     })
   });
   if (!res.ok) console.error("Failed to save progress:", await res.text());
+}
+
+// Extract a YouTube video ID from any common URL shape (watch, youtu.be, shorts, embed)
+function getYouTubeId(url) {
+  if (!url) return null;
+  const m = url.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : null;
 }
 
 // Read the highest set_number that exists in question_library for this topic.
@@ -228,17 +250,18 @@ async function loadTeacherData(uid) {
   ]);
   const cids = classes.map(c => c.id).join(",");
   const aids = assignments.map(a => a.id).join(",");
-  const [cs, as2, questions, accts, subs] = await Promise.all([
+  const [cs, as2, questions, accts, subs, retakeSessions] = await Promise.all([
     cids ? db("class_students", "GET", `class_id=in.(${cids})`) : Promise.resolve([]),
     aids ? db("assignment_students", "GET", `assignment_id=in.(${aids})`) : Promise.resolve([]),
     aids ? db("questions", "GET", `assignment_id=in.(${aids})&order=order_index.asc`) : Promise.resolve([]),
     db("student_accounts", "GET", `select=student_id,invite_token,invite_accepted,auth_user_id,student_name`),
-    aids ? db("submissions", "GET", `assignment_id=in.(${aids})`) : Promise.resolve([])
+    aids ? db("submissions", "GET", `assignment_id=in.(${aids})`) : Promise.resolve([]),
+    aids ? db("retake_sessions", "GET", `assignment_id=in.(${aids})&order=attempt_number.asc`) : Promise.resolve([])
   ]);
   return {
     classes: classes.map(c => ({ ...c, subjects: c.subjects || [], students: cs.filter(x => x.class_id === c.id).map(x => x.student_id) })),
     students: students.map(s => ({ ...s, classes: cs.filter(x => x.student_id === s.id).map(x => x.class_id), account: accts.find(a => a.student_id === s.id) })),
-    assignments: assignments.map(a => ({ ...a, assignedTo: as2.filter(x => x.assignment_id === a.id).map(x => x.student_id), questions: questions.filter(q => q.assignment_id === a.id), submissions: subs.filter(s => s.assignment_id === a.id) }))
+    assignments: assignments.map(a => ({ ...a, assignedTo: as2.filter(x => x.assignment_id === a.id).map(x => x.student_id), questions: questions.filter(q => q.assignment_id === a.id), submissions: subs.filter(s => s.assignment_id === a.id), retakeSessions: retakeSessions.filter(rs => rs.assignment_id === a.id) }))
   };
 }
 
@@ -259,24 +282,33 @@ async function loadStudentData(authUserId) {
   const classIds = cs.map(x => x.class_id).join(",");
   const assignmentIds = as2.map(x => x.assignment_id).join(",");
 
-  const [classes, assignments, submissions, savedAnswers, questions] = await Promise.all([
+  const [classes, assignments, submissions, savedAnswers, questions, retakeSessions] = await Promise.all([
     classIds ? db("classes", "GET", `id=in.(${classIds})`) : Promise.resolve([]),
     assignmentIds ? db("assignments", "GET", `id=in.(${assignmentIds})&order=created_at.desc`) : Promise.resolve([]),
     assignmentIds ? db("submissions", "GET", `student_id=eq.${sid}`) : Promise.resolve([]),
     assignmentIds ? db("student_answers", "GET", `student_id=eq.${sid}`) : Promise.resolve([]),
     // ✅ FIX: load questions so the Start button appears
-    assignmentIds ? db("questions", "GET", `assignment_id=in.(${assignmentIds})&order=order_index.asc`) : Promise.resolve([])
+    assignmentIds ? db("questions", "GET", `assignment_id=in.(${assignmentIds})&order=order_index.asc`) : Promise.resolve([]),
+    assignmentIds ? db("retake_sessions", "GET", `student_id=eq.${sid}`) : Promise.resolve([])
   ]);
 
   return {
     student: { ...student, studentId: sid },
     classes,
-    assignments: assignments.map(a => ({
-      ...a,
-      submission: submissions.find(s => s.assignment_id === a.id) || null,
-      savedAnswers: savedAnswers.filter(sa => sa.assignment_id === a.id),
-      questions: questions.filter(q => q.assignment_id === a.id)  // ✅ FIX: attach questions
-    }))
+    assignments: assignments.map(a => {
+      const attempts = retakeSessions
+        .filter(rs => rs.assignment_id === a.id)
+        .sort((x, y) => x.attempt_number - y.attempt_number);
+      // "Current" session: an unfinished retake takes priority; otherwise the latest one
+      const current = attempts.find(rs => rs.status === "in_progress") || attempts[attempts.length - 1] || null;
+      return {
+        ...a,
+        submission: submissions.find(s => s.assignment_id === a.id) || null,
+        savedAnswers: savedAnswers.filter(sa => sa.assignment_id === a.id),
+        questions: questions.filter(q => q.assignment_id === a.id),  // ✅ FIX: attach questions
+        retakeSession: current
+      };
+    })
   };
 }
 
@@ -994,7 +1026,8 @@ function QuestionBuilder({ questions, setQuestions }) {
       type, text: "",
       options: type === "multiple_choice" ? ["", "", "", ""] : [],
       correct: type === "true_false" ? "true" : "",
-      explanation: ""
+      explanation: "",
+      fromLibrary: false // teacher-authored — gets auto-synced to question_library on save
     }]);
   };
 
@@ -1166,6 +1199,102 @@ function QuestionBuilder({ questions, setQuestions }) {
   );
 }
 
+// ── Topic Video Picker (shared between Add and Edit Assignment) ──────────────
+// Lets a teacher pick an existing YouTube video linked to this topic, or add a
+// new one inline. Videos are matched by grade+subject+topic, same as question_library.
+function TopicVideoPicker({ grade, subject, topic, videoId, setVideoId }) {
+  const [videos, setVideos] = useState([]);
+  const [loadingVideos, setLoadingVideos] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+  const [newUrl, setNewUrl] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    setErr(""); setAdding(false); setNewTitle(""); setNewUrl("");
+    if (!grade || !subject || !topic) { setVideos([]); return; }
+    setLoadingVideos(true);
+    (async () => {
+      try {
+        const rows = await db(
+          "topic_videos", "GET",
+          `grade=eq.${encodeURIComponent(grade)}&subject=eq.${encodeURIComponent(subject)}&topic=eq.${encodeURIComponent(topic)}&order=display_order.asc`
+        );
+        setVideos(rows || []);
+        // If the currently selected video isn't part of this topic's list, clear it
+        if (videoId && !(rows || []).some(v => v.id === videoId)) setVideoId(null);
+      } catch (e) {
+        console.error("Load videos error:", e);
+        setVideos([]);
+      } finally {
+        setLoadingVideos(false);
+      }
+    })();
+  }, [grade, subject, topic]);
+
+  const saveNewVideo = async () => {
+    if (!newUrl.trim()) { setErr("Paste a YouTube URL first."); return; }
+    if (!getYouTubeId(newUrl.trim())) { setErr("That doesn't look like a valid YouTube URL."); return; }
+    setSaving(true); setErr("");
+    try {
+      const nextOrder = videos.length > 0 ? Math.max(...videos.map(v => v.display_order || 1)) + 1 : 1;
+      const [row] = await db("topic_videos", "POST", "", {
+        grade, subject, topic,
+        title: newTitle.trim() || null,
+        youtube_url: newUrl.trim(),
+        display_order: nextOrder
+      });
+      setVideos(p => [...p, row]);
+      setVideoId(row.id);
+      setAdding(false); setNewTitle(""); setNewUrl("");
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!topic) return null;
+
+  return (
+    <div style={{ marginBottom: 16, padding: 14, border: "1.5px solid #E2E8F0", borderRadius: 12, background: "#F8FAFC" }}>
+      <label className="lbl">Video <span style={{ color: "#94A3B8", fontWeight: 400, textTransform: "none" }}>(optional — shown to students for this topic)</span></label>
+
+      {loadingVideos ? (
+        <div style={{ fontSize: 13, color: "#64748B" }}>Loading videos…</div>
+      ) : !adding ? (
+        <>
+          <select className="sel" value={videoId || ""} onChange={e => e.target.value === "__add__" ? setAdding(true) : setVideoId(e.target.value || null)}>
+            <option value="">No video</option>
+            {videos.map(v => <option key={v.id} value={v.id}>{v.title || v.youtube_url}</option>)}
+            <option value="__add__">+ Add new video…</option>
+          </select>
+          {videoId && getYouTubeId(videos.find(v => v.id === videoId)?.youtube_url) && (
+            <div style={{ marginTop: 10, borderRadius: 10, overflow: "hidden", aspectRatio: "16/9", maxWidth: 360 }}>
+              <iframe
+                width="100%" height="100%"
+                src={`https://www.youtube.com/embed/${getYouTubeId(videos.find(v => v.id === videoId)?.youtube_url)}`}
+                title="Video preview" frameBorder="0" allowFullScreen
+              />
+            </div>
+          )}
+        </>
+      ) : (
+        <div style={{ marginTop: 8 }}>
+          {err && <div className="err" style={{ marginBottom: 8 }}>{err}</div>}
+          <input className="inp" placeholder="YouTube URL" value={newUrl} onChange={e => setNewUrl(e.target.value)} style={{ marginBottom: 8 }} />
+          <input className="inp" placeholder="Title (optional)" value={newTitle} onChange={e => setNewTitle(e.target.value)} style={{ marginBottom: 8 }} />
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="btn2" onClick={() => { setAdding(false); setErr(""); }} style={{ fontSize: 12 }}>Cancel</button>
+            <button className="btn1" onClick={saveNewVideo} disabled={saving} style={{ fontSize: 12 }}>{saving ? "Saving…" : "Save Video"}</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Add Assignment Modal ──────────────────────────────────────────────────────
 function AddAssignmentModal({ classes, students, reload, userId, data, close }) {
   const [step, setStep] = useState(1);
@@ -1174,6 +1303,7 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
   const [topic, setTopic] = useState("");
   const [topicOptions, setTopicOptions] = useState([]);
   const [loadingTopics, setLoadingTopics] = useState(false);
+  const [videoId, setVideoId] = useState(null);
   const [classId, setClassId] = useState(data.classId || classes[0]?.id || "");
   const [dueDate, setDueDate] = useState("");
   const [desc, setDesc] = useState("");
@@ -1226,6 +1356,7 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
         teacher_id: userId, class_id: classId, subject,
         title: title.trim(), description: desc,
         topic: topic.trim() || null,
+        topic_video_id: videoId || null,
         due_date: dueDate || null,
         file_name: fileName || null,
         status: "active"
@@ -1255,18 +1386,48 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
 
       // 4. Save questions
       const validQuestions = questions.filter(q => q.text.trim() && q.correct);
+      let insertedQuestions = [];
       if (validQuestions.length > 0) {
         setUploadProgress("Saving questions…");
-        await Promise.all(validQuestions.map((q, i) =>
+        insertedQuestions = await Promise.all(validQuestions.map((q, i) =>
           db("questions", "POST", "", {
             assignment_id: newA.id, question_text: q.text,
             question_type: q.type,
             options: q.type === "multiple_choice" ? q.options : null,
             correct_answer: q.correct,
             explanation: q.explanation || null,
-            points: 1, order_index: i
-          })
+            points: 1, order_index: i,
+            synced_to_library: !!q.fromLibrary
+          }).then(rows => ({ row: rows[0], src: q }))
         ));
+      }
+
+      // 5. Auto-add teacher-authored (non-library) questions to the shared question library,
+      // so future retakes/other assignments can draw from them too.
+      const gradeForLib = selClass?.grade;
+      if (topic.trim() && gradeForLib) {
+        const toSync = insertedQuestions.filter(iq => !iq.src.fromLibrary);
+        if (toSync.length > 0) {
+          setUploadProgress("Adding your questions to the library…");
+          try {
+            const setNum = await getMaxSetNumber(gradeForLib, subject, topic.trim());
+            await Promise.all(toSync.map(iq =>
+              db("question_library", "POST", "", {
+                grade: gradeForLib, subject, topic: topic.trim(),
+                set_number: setNum,
+                question_type: iq.src.type, question_text: iq.src.text,
+                options: iq.src.type === "multiple_choice" ? iq.src.options : null,
+                correct_answer: iq.src.correct, explanation: iq.src.explanation || null
+              })
+            ));
+            await Promise.all(toSync.map(iq =>
+              db("questions", "PATCH", `id=eq.${iq.row.id}`, { synced_to_library: true })
+            ));
+          } catch (syncErr) {
+            // Non-fatal — the assignment itself is already saved successfully
+            console.error("Library sync failed:", syncErr);
+          }
+        }
       }
 
       await reload();
@@ -1323,6 +1484,7 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
             {topicOptions.map(t => <option key={t} value={t}>{t}</option>)}
           </select>
         </div>
+        <TopicVideoPicker grade={selClass?.grade} subject={subject} topic={topic.trim()} videoId={videoId} setVideoId={setVideoId} />
         <div style={{ marginBottom: 16 }}>
           <label className="lbl">Due Date</label>
           <input className="inp" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} />
@@ -1415,6 +1577,7 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
   const [title, setTitle] = useState(a.title);
   const [subject, setSubject] = useState(a.subject);
   const [topic, setTopic] = useState(a.topic || "");
+  const [videoId, setVideoId] = useState(a.topic_video_id || null);
   const [dueDate, setDueDate] = useState(a.due_date || "");
   const [desc, setDesc] = useState(a.description || "");
 
@@ -1426,7 +1589,10 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
       text: q.question_text,
       options: q.options || ["", "", "", ""],
       correct: q.correct_answer,
-      explanation: q.explanation || ""
+      explanation: q.explanation || "",
+      // Already-synced questions (from the library or a prior save) won't be re-synced.
+      // Legacy rows without this column default to false, so they'll sync on next save.
+      fromLibrary: !!q.synced_to_library
     }))
   );
 
@@ -1478,15 +1644,18 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
         title: title.trim(),
         subject,
         topic: topic.trim() || null,
+        topic_video_id: videoId || null,
         due_date: dueDate || null,
         description: desc
       });
 
       // 2. Update questions (delete all, re-insert)
       await db("questions", "DELETE", `assignment_id=eq.${a.id}`);
-      if (questions.filter(q => q.text.trim() && q.correct).length > 0) {
-        await Promise.all(
-          questions.filter(q => q.text.trim() && q.correct).map((q, i) =>
+      const validQuestions = questions.filter(q => q.text.trim() && q.correct);
+      let insertedQuestions = [];
+      if (validQuestions.length > 0) {
+        insertedQuestions = await Promise.all(
+          validQuestions.map((q, i) =>
             db("questions", "POST", "", {
               assignment_id: a.id,
               question_text: q.text,
@@ -1495,10 +1664,35 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
               correct_answer: q.correct,
               explanation: q.explanation || null,
               points: 1,
-              order_index: i
-            })
+              order_index: i,
+              synced_to_library: !!q.fromLibrary
+            }).then(rows => ({ row: rows[0], src: q }))
           )
         );
+      }
+
+      // 2b. Auto-add teacher-authored (not-yet-synced) questions to the shared question library
+      if (topic.trim() && selClass?.grade) {
+        const toSync = insertedQuestions.filter(iq => !iq.src.fromLibrary);
+        if (toSync.length > 0) {
+          try {
+            const setNum = await getMaxSetNumber(selClass.grade, subject, topic.trim());
+            await Promise.all(toSync.map(iq =>
+              db("question_library", "POST", "", {
+                grade: selClass.grade, subject, topic: topic.trim(),
+                set_number: setNum,
+                question_type: iq.src.type, question_text: iq.src.text,
+                options: iq.src.type === "multiple_choice" ? iq.src.options : null,
+                correct_answer: iq.src.correct, explanation: iq.src.explanation || null
+              })
+            ));
+            await Promise.all(toSync.map(iq =>
+              db("questions", "PATCH", `id=eq.${iq.row.id}`, { synced_to_library: true })
+            ));
+          } catch (syncErr) {
+            console.error("Library sync failed:", syncErr);
+          }
+        }
       }
 
       // 3. Update assignment_students (diff old vs new)
@@ -1575,6 +1769,7 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
             {topicOptions.map(t => <option key={t} value={t}>{t}</option>)}
           </select>
         </div>
+        <TopicVideoPicker grade={selClass?.grade} subject={subject} topic={topic.trim()} videoId={videoId} setVideoId={setVideoId} />
         <div style={{ marginBottom: 20 }}>
           <label className="lbl">Instructions</label>
           <textarea className="inp" rows={3} value={desc} onChange={e => setDesc(e.target.value)} style={{ resize: "vertical" }} />
@@ -1677,7 +1872,50 @@ function ViewAssignmentModal({ assignment: a, students, classes, close }) {
 function AssignmentResultsModal({ assignment: a, students, close }) {
   if (!a) return null;
   const subs = a.submissions || [];
-  return (<div><div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}><div><div style={{ fontFamily: "Outfit,sans-serif", fontSize: 20, fontWeight: 800, color: "#0F172A" }}>{a.title} — Results</div><div style={{ color: "#64748B", fontSize: 13 }}>{a.questions?.length || 0} questions · {subs.length} submissions</div></div><button style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: "#94A3B8" }} onClick={close}>✕</button></div>{subs.length === 0 && <div style={{ textAlign: "center", padding: 32, color: "#94A3B8" }}>No submissions yet.</div>}{subs.map(sub => { const st = students.find(s => s.id === sub.student_id); const pct = sub.percentage || 0; return (<div key={sub.id} style={{ display: "flex", alignItems: "center", gap: 14, padding: "14px 0", borderBottom: "1px solid #F1F5F9" }}><div className="av" style={{ background: getAC(sub.student_id) }}>{st?.avatar || st?.name?.[0] || "?"}</div><div style={{ flex: 1 }}><div style={{ fontWeight: 600, fontSize: 14, color: "#0F172A" }}>{st?.name || "Unknown"}</div><div style={{ fontSize: 12, color: "#64748B" }}>{new Date(sub.submitted_at).toLocaleDateString()}</div></div><div style={{ textAlign: "right" }}><div style={{ fontFamily: "Outfit,sans-serif", fontSize: 22, fontWeight: 800, color: pct >= 70 ? "#059669" : pct >= 50 ? "#D97706" : "#DC2626" }}>{pct}%</div><div style={{ fontSize: 12, color: "#64748B" }}>{sub.score}/{sub.total_points} pts</div></div></div>); })}<div style={{ marginTop: 20, textAlign: "right" }}><button className="btn2" onClick={close}>Close</button></div></div>);
+  const retakes = a.retakeSessions || [];
+  // Union of every student who has either an original submission or at least one retake attempt
+  const studentIds = [...new Set([...subs.map(s => s.student_id), ...retakes.map(r => r.student_id)])];
+  return (<div><div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}><div><div style={{ fontFamily: "Outfit,sans-serif", fontSize: 20, fontWeight: 800, color: "#0F172A" }}>{a.title} — Results</div><div style={{ color: "#64748B", fontSize: 13 }}>{a.questions?.length || 0} questions · {subs.length} submissions</div></div><button style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: "#94A3B8" }} onClick={close}>✕</button></div>{studentIds.length === 0 && <div style={{ textAlign: "center", padding: 32, color: "#94A3B8" }}>No submissions yet.</div>}{studentIds.map(sid => {
+    const st = students.find(s => s.id === sid);
+    const sub = subs.find(s => s.student_id === sid);
+    const myRetakes = retakes.filter(r => r.student_id === sid).sort((x, y) => x.attempt_number - y.attempt_number);
+    const pct = sub?.percentage ?? 0;
+    return (
+      <div key={sid} style={{ padding: "14px 0", borderBottom: "1px solid #F1F5F9" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <div className="av" style={{ background: getAC(sid) }}>{st?.avatar || st?.name?.[0] || "?"}</div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 600, fontSize: 14, color: "#0F172A" }}>{st?.name || "Unknown"}</div>
+            <div style={{ fontSize: 12, color: "#64748B" }}>{sub ? `Original · ${new Date(sub.submitted_at).toLocaleDateString()}` : "No original submission"}</div>
+          </div>
+          {sub && (
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 22, fontWeight: 800, color: pct >= 70 ? "#059669" : pct >= 50 ? "#D97706" : "#DC2626" }}>{pct}%</div>
+              <div style={{ fontSize: 12, color: "#64748B" }}>{sub.score}/{sub.total_points} pts</div>
+            </div>
+          )}
+        </div>
+        {myRetakes.length > 0 && (
+          <div style={{ marginLeft: 54, marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+            {myRetakes.map(r => (
+              <div key={r.id} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, background: "#F8FAFF", borderRadius: 8, padding: "6px 10px" }}>
+                <span style={{ fontWeight: 600, color: "#4F46E5" }}>Retake {r.attempt_number}</span>
+                {r.status === "submitted" ? (
+                  <>
+                    <span style={{ fontWeight: 700, color: (r.percentage || 0) >= 70 ? "#059669" : (r.percentage || 0) >= 50 ? "#D97706" : "#DC2626" }}>{r.percentage}%</span>
+                    <span style={{ color: "#64748B" }}>{r.score}/{r.total_points} pts</span>
+                    <span style={{ color: "#94A3B8", marginLeft: "auto" }}>{new Date(r.updated_at).toLocaleDateString()}</span>
+                  </>
+                ) : (
+                  <span style={{ color: "#D97706", fontWeight: 600 }}>In progress…</span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  })}<div style={{ marginTop: 20, textAlign: "right" }}><button className="btn2" onClick={close}>Close</button></div></div>);
 }
 
 function AssignStudentsModal({ cls, students, reload, close }) {
@@ -1747,7 +1985,9 @@ const [loadingTopics, setLoadingTopics] = useState(false);
 {assignments.map(a => {
   const cls = classes.find(c => c.id === a.class_id);
   const sub = a.submission;
-  const status = sub?.status || "not_started";
+  const rs = a.retakeSession;
+  // A retake session (if any) supersedes the original submission for status/score purposes
+  const status = rs ? rs.status : (sub?.status || "not_started");
   const d = Math.ceil((new Date(a.due_date) - new Date()) / 86400000);
   const hasQ = a.questions && a.questions.length > 0;
 
@@ -1797,13 +2037,14 @@ const [loadingTopics, setLoadingTopics] = useState(false);
         <div style={{ color: "#64748B", fontSize: 12, marginTop: 2 }}>{cls?.name} · {a.subject}</div>
         {hasQ && (
           <div style={{ fontSize: 12, color: "#4F46E5", marginTop: 2 }}>
-            {a.questions.length} question{a.questions.length !== 1 ? "s" : ""}
-            {status === "in_progress" && a.savedAnswers?.length > 0 ? ` · ${a.savedAnswers.length} answered` : ""}
+            {rs ? `${rs.questions?.length || 0} question${(rs.questions?.length || 0) !== 1 ? "s" : ""} · Retake ${rs.attempt_number}` : `${a.questions.length} question${a.questions.length !== 1 ? "s" : ""}`}
+            {status === "in_progress" && !rs && a.savedAnswers?.length > 0 ? ` · ${a.savedAnswers.length} answered` : ""}
+            {status === "in_progress" && rs ? ` · ${Object.keys(rs.answers || {}).length} answered` : ""}
           </div>
         )}
-        {status === "submitted" && sub && hasQ && (
-          <div style={{ fontSize: 13, fontWeight: 700, marginTop: 4, color: sub.percentage >= 70 ? "#059669" : sub.percentage >= 50 ? "#D97706" : "#DC2626" }}>
-            Score: {sub.score}/{sub.total_points} ({sub.percentage}%)
+        {status === "submitted" && hasQ && (
+          <div style={{ fontSize: 13, fontWeight: 700, marginTop: 4, color: (rs ? rs.percentage : sub.percentage) >= 70 ? "#059669" : (rs ? rs.percentage : sub.percentage) >= 50 ? "#D97706" : "#DC2626" }}>
+            Score: {rs ? rs.score : sub.score}/{rs ? rs.total_points : sub.total_points} ({rs ? rs.percentage : sub.percentage}%)
           </div>
         )}
       </div>
@@ -1832,6 +2073,8 @@ function LibraryBrowser({ onAdd, close }) {
   const [grade, setGrade] = useState("Grade 8");
   const [subject, setSubject] = useState("Math");
   const [topic, setTopic] = useState("");
+  const [setFilter, setSetFilter] = useState(""); // "" = all sets
+  const [setOptions, setSetOptions] = useState([]);
   const [questions, setQuestions] = useState([]);
   const [topics, setTopics] = useState([]);
   const [selected, setSelected] = useState(new Set());
@@ -1855,21 +2098,38 @@ function LibraryBrowser({ onAdd, close }) {
     })();
   }, [grade, subject]);
 
+  // Load available set numbers when topic changes
+  useEffect(() => {
+    setSetFilter(""); // reset to "All Sets" whenever topic changes
+    if (!grade || !subject || !topic) { setSetOptions([]); return; }
+    (async () => {
+      try {
+        const rows = await db(
+          "question_library", "GET",
+          `grade=eq.${encodeURIComponent(grade)}&subject=eq.${encodeURIComponent(subject)}&topic=eq.${encodeURIComponent(topic)}&select=set_number`
+        );
+        const uniqueSets = [...new Set((rows || []).map(r => r.set_number))].sort((a, b) => a - b);
+        setSetOptions(uniqueSets);
+      } catch (e) { console.error(e); setSetOptions([]); }
+    })();
+  }, [grade, subject, topic]);
+
   const search = async () => {
     if (!grade || !subject || !topic) return;
     setLoading(true); setSelected(new Set()); setSearched(true);
     try {
+      const setClause = setFilter ? `&set_number=eq.${setFilter}` : "";
       const rows = await db(
         "question_library", "GET",
-        `grade=eq.${encodeURIComponent(grade)}&subject=eq.${encodeURIComponent(subject)}&topic=eq.${encodeURIComponent(topic)}&order=created_at.asc`
+        `grade=eq.${encodeURIComponent(grade)}&subject=eq.${encodeURIComponent(subject)}&topic=eq.${encodeURIComponent(topic)}${setClause}&order=set_number.asc,created_at.asc`
       );
       setQuestions(rows || []);
     } catch (e) { console.error(e); setQuestions([]); }
     finally { setLoading(false); }
   };
 
-  // Auto-search when topic changes
-  useEffect(() => { if (topic) search(); }, [topic]);
+  // Auto-search when topic or set filter changes
+  useEffect(() => { if (topic) search(); }, [topic, setFilter]);
 
   const toggle = (id) => setSelected(prev => {
     const n = new Set(prev);
@@ -1889,7 +2149,8 @@ function LibraryBrowser({ onAdd, close }) {
         text: q.question_text,
         options: q.options || ["", "", "", ""],
         correct: q.correct_answer,
-        explanation: q.explanation || ""
+        explanation: q.explanation || "",
+        fromLibrary: true // already lives in question_library — don't re-sync on save
       }));
     onAdd(toAdd);
     close();
@@ -1915,7 +2176,7 @@ function LibraryBrowser({ onAdd, close }) {
       </div>
 
       {/* Filters */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 16 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12, marginBottom: 16 }}>
         <div>
           <label className="lbl">Grade</label>
           <select className="sel" value={grade} onChange={e => setGrade(e.target.value)}>
@@ -1935,6 +2196,13 @@ function LibraryBrowser({ onAdd, close }) {
               ? <option>No topics found</option>
               : topics.map(t => <option key={t}>{t}</option>)
             }
+          </select>
+        </div>
+        <div>
+          <label className="lbl">Set</label>
+          <select className="sel" value={setFilter} onChange={e => setSetFilter(e.target.value)} disabled={setOptions.length === 0}>
+            <option value="">All Sets</option>
+            {setOptions.map(s => <option key={s} value={s}>Set {s}</option>)}
           </select>
         </div>
       </div>
@@ -2094,6 +2362,7 @@ function TopicPracticeModal({ grade, subject, topic, student, onClose }) {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [savingQ, setSavingQ] = useState(null);
+  const [video, setVideo] = useState(null);
 
   // Load questions on mount
   useEffect(() => {
@@ -2110,6 +2379,16 @@ function TopicPracticeModal({ grade, subject, topic, student, onClose }) {
       } finally {
         setLoading(false);
       }
+    })();
+    // Load the linked video for this topic, if any
+    (async () => {
+      try {
+        const rows = await db(
+          "topic_videos", "GET",
+          `grade=eq.${encodeURIComponent(grade)}&subject=eq.${encodeURIComponent(subject)}&topic=eq.${encodeURIComponent(topic)}&order=display_order.asc&limit=1`
+        );
+        setVideo(rows?.[0] || null);
+      } catch (e) { console.error("Load video error:", e); }
     })();
   }, []);
 
@@ -2225,6 +2504,22 @@ function TopicPracticeModal({ grade, subject, topic, student, onClose }) {
           </div>
         )}
 
+        {/* Linked video */}
+        {!submitted && video && getYouTubeId(video.youtube_url) && (
+          <div className="fade" style={{ marginBottom: 24 }}>
+            <div style={{ fontWeight: 700, fontSize: 14, color: "#0F172A", marginBottom: 8 }}>
+              📺 {video.title || "Watch before you start"}
+            </div>
+            <div style={{ borderRadius: 14, overflow: "hidden", aspectRatio: "16/9" }}>
+              <iframe
+                width="100%" height="100%"
+                src={`https://www.youtube.com/embed/${getYouTubeId(video.youtube_url)}`}
+                title={video.title || "Lesson video"} frameBorder="0" allowFullScreen
+              />
+            </div>
+          </div>
+        )}
+
         {/* Questions */}
         {(submitted ? result.graded : questions).map((q, i) => {
           const selected = submitted ? q.selected : answers[q.id];
@@ -2321,6 +2616,7 @@ function QuizInterface({ assignment, student, session, onClose }) {
   const [retakeMode, setRetakeMode] = useState(false);
   const [retakeAttempt, setRetakeAttempt] = useState(1);
   const [retaking, setRetaking] = useState(false);
+  const [video, setVideo] = useState(null);
   const alreadySubmitted = assignment.submission?.status === "submitted";
 
   const grade = student.grade;
@@ -2337,17 +2633,38 @@ function QuizInterface({ assignment, student, session, onClose }) {
   useEffect(() => {
     (async () => {
       try {
-        const qs = await db("questions", "GET", `assignment_id=eq.${assignment.id}&order=order_index.asc`);
-        setQuestions(qs || []);
-        // Restore saved answers
-        const saved = assignment.savedAnswers || [];
-        const ans = {};
-        saved.forEach(sa => { ans[sa.question_id] = sa.selected_answer; });
-        setAnswers(ans);
-        // If already submitted, load result
-        if (alreadySubmitted) {
-          setSubmitted(true);
-          setResult(assignment.submission);
+        const rs = assignment.retakeSession;
+        if (rs) {
+          // A retake session exists — it supersedes the original attempt entirely.
+          // Resume it if unfinished, or show its result if it was submitted.
+          setQuestions(rs.questions || []);
+          setAnswers(rs.answers || {});
+          setRetakeMode(true);
+          setRetakeAttempt(rs.attempt_number);
+          if (rs.status === "submitted") {
+            setSubmitted(true);
+            setResult({ score: rs.score, total_points: rs.total_points, percentage: rs.percentage });
+          }
+        } else {
+          const qs = await db("questions", "GET", `assignment_id=eq.${assignment.id}&order=order_index.asc`);
+          setQuestions(qs || []);
+          // Restore saved answers
+          const saved = assignment.savedAnswers || [];
+          const ans = {};
+          saved.forEach(sa => { ans[sa.question_id] = sa.selected_answer; });
+          setAnswers(ans);
+          // If already submitted, load result
+          if (alreadySubmitted) {
+            setSubmitted(true);
+            setResult(assignment.submission);
+          }
+        }
+        // Load the linked video for this topic, if any
+        if (assignment.topic_video_id) {
+          try {
+            const vrows = await db("topic_videos", "GET", `id=eq.${assignment.topic_video_id}`);
+            setVideo(vrows?.[0] || null);
+          } catch (e) { console.error("Load video error:", e); }
         }
       } catch (e) { console.error("QuizInterface load error:", e); }
       finally { setLoading(false); }
@@ -2356,15 +2673,25 @@ function QuizInterface({ assignment, student, session, onClose }) {
 
   // FIX 1: use saveAnswer() with correct on_conflict
   const selectAnswer = async (questionId, answer) => {
-    setAnswers(p => ({ ...p, [questionId]: answer }));
-    if (retakeMode) return; // retake questions aren't tied to this assignment_id — just track locally
+    const nextAnswers = { ...answers, [questionId]: answer };
+    setAnswers(nextAnswers);
     setSavingQ(questionId);
     try {
-      await saveAnswer(student.studentId, assignment.id, questionId, answer);
-      await saveSubmission(student.studentId, assignment.id, {
-        status: "in_progress", score: 0,
-        total_points: questions.length, percentage: 0
-      });
+      if (retakeMode) {
+        // Retake questions aren't tied to assignment_id in the "questions" table —
+        // persist to retake_sessions instead so Back/resume doesn't lose progress.
+        await saveRetakeSession(student.studentId, assignment.id, {
+          attempt_number: retakeAttempt,
+          questions, answers: nextAnswers,
+          status: "in_progress"
+        });
+      } else {
+        await saveAnswer(student.studentId, assignment.id, questionId, answer);
+        await saveSubmission(student.studentId, assignment.id, {
+          status: "in_progress", score: 0,
+          total_points: questions.length, percentage: 0
+        });
+      }
     } catch (e) { console.error("Save answer error:", e); }
     finally { setSavingQ(null); }
   };
@@ -2386,6 +2713,11 @@ function QuizInterface({ assignment, student, session, onClose }) {
         });
         const pct = total > 0 ? Math.round((score / total) * 100) : 0;
         await saveTopicProgress(student.studentId, grade, subject, topic, retakeAttempt, score, pct);
+        await saveRetakeSession(student.studentId, assignment.id, {
+          attempt_number: retakeAttempt,
+          questions, answers,
+          status: "submitted", score, total_points: total, percentage: pct
+        });
         setResult({ score, total_points: total, percentage: pct });
       } else {
         // Save all answers with is_correct flag
@@ -2419,6 +2751,10 @@ function QuizInterface({ assignment, student, session, onClose }) {
       setSubmitted(false);
       setRetakeMode(true);
       setRetakeAttempt(att);
+      // Persist immediately so a Back-out right after starting still resumes this exact set
+      await saveRetakeSession(student.studentId, assignment.id, {
+        attempt_number: att, questions: qs, answers: {}, status: "in_progress"
+      });
     } catch (e) {
       alert("Couldn't load a new set: " + e.message);
     } finally {
@@ -2537,6 +2873,22 @@ function QuizInterface({ assignment, student, session, onClose }) {
             <div style={{ fontSize: 18, marginTop: 4, opacity: 0.9 }}>{result.score} out of {result.total_points} correct</div>
             <div style={{ fontSize: 14, marginTop: 8, opacity: 0.8 }}>
               {result.percentage >= 70 ? "Great job! 🌟" : result.percentage >= 50 ? "Good effort! Review the answers below." : "Keep practicing — you'll get there! 💪"}
+            </div>
+          </div>
+        )}
+
+        {/* Linked video — shown before attempting (and before a retake) */}
+        {!submitted && video && getYouTubeId(video.youtube_url) && (
+          <div className="fade" style={{ marginBottom: 24 }}>
+            <div style={{ fontWeight: 700, fontSize: 14, color: "#0F172A", marginBottom: 8 }}>
+              📺 {video.title || "Watch before you start"}
+            </div>
+            <div style={{ borderRadius: 14, overflow: "hidden", aspectRatio: "16/9" }}>
+              <iframe
+                width="100%" height="100%"
+                src={`https://www.youtube.com/embed/${getYouTubeId(video.youtube_url)}`}
+                title={video.title || "Lesson video"} frameBorder="0" allowFullScreen
+              />
             </div>
           </div>
         )}
