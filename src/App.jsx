@@ -238,6 +238,18 @@ async function sbSignIn(email, password) {
   return { ...data, _ok: r.ok, _status: r.status };
 }
 
+// Exchange a stored refresh_token for a fresh access_token — lets a page
+// refresh/reopen restore the session instead of forcing the person to log in again.
+async function sbRefreshSession(refreshToken) {
+  const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: "POST",
+    headers: { apikey: SB_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ refresh_token: refreshToken })
+  });
+  const data = await r.json();
+  return { ...data, _ok: r.ok, _status: r.status };
+}
+
 async function sbSignOut() {
   await fetch(`${SB_URL}/auth/v1/logout`, { method: "POST", headers: { apikey: SB_KEY, Authorization: `Bearer ${TOKEN}` } });
 }
@@ -636,12 +648,50 @@ function AuthScreen({ onLogin }) {
 }
 
 // ── Root ──────────────────────────────────────────────────────────────────────
+const SESSION_KEY = "eduhive_session";
+
 export default function TutoringApp() {
   const [inviteToken, setInviteToken] = useState(null);
   const [appUser, setAppUser] = useState(null);
+  const [restoring, setRestoring] = useState(true);
+
   useEffect(() => { const p = new URLSearchParams(window.location.search); const t = p.get("invite"); if (t) setInviteToken(t); }, []);
-  const handleLogin = info => setAppUser(info);
-  const handleLogout = async () => { await sbSignOut(); TOKEN = SB_KEY; setAppUser(null); setInviteToken(null); };
+
+  // On mount (including a browser refresh), try to restore a previous session
+  // via the saved refresh_token instead of forcing the person to log in again.
+  useEffect(() => {
+    (async () => {
+      let saved;
+      try { saved = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null"); } catch { saved = null; }
+      if (!saved?.refresh_token) { setRestoring(false); return; }
+      try {
+        const res = await sbRefreshSession(saved.refresh_token);
+        if (!res._ok || !res.access_token) throw new Error("Session expired");
+        TOKEN = res.access_token;
+        persistSession(res, saved.type);
+        const data = saved.type === "student" ? await loadStudentData(res.user.id) : await loadTeacherData(res.user.id);
+        setAppUser({ type: saved.type, session: res, data });
+      } catch (e) {
+        sessionStorage.removeItem(SESSION_KEY);
+      } finally {
+        setRestoring(false);
+      }
+    })();
+  }, []);
+
+  const persistSession = (session, type) => {
+    try { sessionStorage.setItem(SESSION_KEY, JSON.stringify({ refresh_token: session.refresh_token, type })); }
+    catch (e) { /* storage unavailable (e.g. private browsing) — session just won't survive a refresh */ }
+  };
+
+  const handleLogin = info => { persistSession(info.session, info.type); setAppUser(info); };
+  const handleLogout = async () => { await sbSignOut(); TOKEN = SB_KEY; sessionStorage.removeItem(SESSION_KEY); setAppUser(null); setInviteToken(null); };
+
+  if (restoring) return (
+    <div style={{ fontFamily: "'Inter','Outfit',sans-serif", minHeight: "100vh", background: "#F0F2F8" }}>
+      <style>{CSS}</style><Loader text="Loading…" />
+    </div>
+  );
   if (!appUser && inviteToken) return <InviteSetupScreen token={inviteToken} onLogin={handleLogin} />;
   if (!appUser) return <AuthScreen onLogin={handleLogin} />;
   if (appUser.type === "student") return <StudentApp initialData={appUser.data} session={appUser.session} onLogout={handleLogout} />;
@@ -685,7 +735,7 @@ function TeacherApp({ initialData, session, onLogout }) {
           {view === "subjects" && <SubjectsView {...ctx} />}
         </>}
       </div>
-      {modal && <div className="ovl" onClick={closeModal}><div className="modal" onClick={e => e.stopPropagation()}>
+      {modal && <div className="ovl"><div className="modal" onClick={e => e.stopPropagation()}>
         {modal === "addClass" && <AddClassModal {...ctx} close={closeModal} />}
         {modal === "addStudent" && <AddStudentModal {...ctx} close={closeModal} />}
         {modal === "addAssignment" && <AddAssignmentModal {...ctx} data={modalData} close={closeModal} />}
@@ -694,7 +744,7 @@ function TeacherApp({ initialData, session, onLogout }) {
         {modal === "viewClass" && <ViewClassModal cls={modalData.cls} students={students} assignments={assignments} close={closeModal} />}
         {modal === "assignStudents" && <AssignStudentsModal cls={modalData.cls} {...ctx} close={closeModal} />}
         {modal === "studentInvite" && <StudentInviteModal student={modalData.student} {...ctx} close={closeModal} />}
-        {modal === "assignmentResults" && <AssignmentResultsModal assignment={modalData.assignment} students={students} close={closeModal} />}
+        {modal === "assignmentResults" && <AssignmentResultsModal assignment={modalData.assignment} students={students} reload={reload} close={closeModal} />}
       </div></div>}
     </div>
   );
@@ -1051,7 +1101,7 @@ function QuestionBuilder({ questions, setQuestions }) {
     <>
       {/* Library Browser Modal */}
       {showLibrary && (
-        <div className="ovl" onClick={() => setShowLibrary(false)}>
+        <div className="ovl">
           <div className="modal" style={{ width: 680 }} onClick={e => e.stopPropagation()}>
             <LibraryBrowser onAdd={addFromLibrary} close={() => setShowLibrary(false)} />
           </div>
@@ -1305,6 +1355,7 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
   const [topicOptions, setTopicOptions] = useState([]);
   const [loadingTopics, setLoadingTopics] = useState(false);
   const [videoId, setVideoId] = useState(null);
+  const [requiresUpload, setRequiresUpload] = useState(false);
   const [classId, setClassId] = useState(data.classId || classes[0]?.id || "");
   const [dueDate, setDueDate] = useState("");
   const [desc, setDesc] = useState("");
@@ -1358,6 +1409,7 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
         title: title.trim(), description: desc,
         topic: topic.trim() || null,
         topic_video_id: videoId || null,
+        requires_upload: requiresUpload,
         due_date: dueDate || null,
         file_name: fileName || null,
         status: "active"
@@ -1490,6 +1542,15 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
           <label className="lbl">Due Date</label>
           <input className="inp" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} />
         </div>
+        <label style={{ display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 16, padding: 12, border: "1.5px solid #E2E8F0", borderRadius: 10, cursor: "pointer", background: requiresUpload ? "#FFFBEB" : "transparent" }}>
+          <input type="checkbox" checked={requiresUpload} onChange={e => setRequiresUpload(e.target.checked)} style={{ accentColor: "#D97706", marginTop: 2 }} />
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 13, color: "#0F172A" }}>Requires student upload &amp; teacher grading</div>
+            <div style={{ fontSize: 12, color: "#64748B", marginTop: 2 }}>
+              Student uploads their completed work (photo/PDF/doc) instead of getting an instant score. Even if you add multiple-choice/true-false questions too, the whole assignment stays "Under Review" until you grade it.
+            </div>
+          </div>
+        </label>
         <div style={{ marginBottom: 16 }}>
           <label className="lbl">Instructions</label>
           <textarea className="inp" rows={2} placeholder="Describe the assignment…" value={desc} onChange={e => setDesc(e.target.value)} style={{ resize: "vertical" }} />
@@ -1579,8 +1640,16 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
   const [subject, setSubject] = useState(a.subject);
   const [topic, setTopic] = useState(a.topic || "");
   const [videoId, setVideoId] = useState(a.topic_video_id || null);
+  const [requiresUpload, setRequiresUpload] = useState(!!a.requires_upload);
   const [dueDate, setDueDate] = useState(a.due_date || "");
   const [desc, setDesc] = useState(a.description || "");
+  const [file, setFile] = useState(null);              // newly-selected replacement file
+  const [fileName, setFileName] = useState(a.file_name || null);
+  const fileRef = useRef();
+  const handleFile = (e) => {
+    const f = e.target.files[0];
+    if (f) { setFile(f); setFileName(f.name); }
+  };
 
   // Questions state — pre-load existing questions
   const [questions, setQuestions] = useState(
@@ -1646,9 +1715,23 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
         subject,
         topic: topic.trim() || null,
         topic_video_id: videoId || null,
+        requires_upload: requiresUpload,
         due_date: dueDate || null,
-        description: desc
+        description: desc,
+        file_name: fileName || null,
+        ...(fileName ? {} : { file_url: null }) // cleared via "Remove file"
       });
+
+      // 1b. Upload a newly-selected replacement file, if any
+      if (file) {
+        try {
+          const fileUrl = await uploadFile(file, userId, a.id);
+          await db("assignments", "PATCH", `id=eq.${a.id}`, { file_url: fileUrl });
+        } catch (uploadErr) {
+          console.error("File upload failed:", uploadErr);
+          setErr("Assignment saved but file upload failed: " + uploadErr.message);
+        }
+      }
 
       // 2. Update questions (delete all, re-insert)
       await db("questions", "DELETE", `assignment_id=eq.${a.id}`);
@@ -1771,10 +1854,57 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
           </select>
         </div>
         <TopicVideoPicker grade={selClass?.grade} subject={subject} topic={topic.trim()} videoId={videoId} setVideoId={setVideoId} />
+        <label style={{ display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 16, padding: 12, border: "1.5px solid #E2E8F0", borderRadius: 10, cursor: "pointer", background: requiresUpload ? "#FFFBEB" : "transparent" }}>
+          <input type="checkbox" checked={requiresUpload} onChange={e => setRequiresUpload(e.target.checked)} style={{ accentColor: "#D97706", marginTop: 2 }} />
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 13, color: "#0F172A" }}>Requires student upload &amp; teacher grading</div>
+            <div style={{ fontSize: 12, color: "#64748B", marginTop: 2 }}>
+              Student uploads their completed work (photo/PDF/doc) instead of getting an instant score. Even if you add multiple-choice/true-false questions too, the whole assignment stays "Under Review" until you grade it.
+            </div>
+          </div>
+        </label>
         <div style={{ marginBottom: 20 }}>
           <label className="lbl">Instructions</label>
           <textarea className="inp" rows={3} value={desc} onChange={e => setDesc(e.target.value)} style={{ resize: "vertical" }} />
         </div>
+
+        {/* File Upload — worksheet/attachment for students to work from */}
+        <div style={{ marginBottom: 20 }}>
+          <label className="lbl">Attach File <span style={{ color: "#94A3B8", fontWeight: 400, textTransform: "none" }}>(optional — PDF, DOCX, images, etc.)</span></label>
+          <div
+            onClick={() => fileRef.current.click()}
+            style={{ border: `2px dashed ${file ? "#4F46E5" : "#C7D2FE"}`, borderRadius: 12, padding: 20, textAlign: "center", cursor: "pointer", background: file ? "#EEF2FF" : "#F5F3FF", transition: "all 0.18s" }}
+          >
+            {file ? (
+              <div>
+                <div style={{ fontSize: 28, marginBottom: 4 }}>📄</div>
+                <div style={{ fontWeight: 600, color: "#4F46E5", fontSize: 14 }}>{file.name}</div>
+                <div style={{ color: "#64748B", fontSize: 12, marginTop: 2 }}>
+                  {(file.size / 1024 / 1024).toFixed(2)} MB · Click to change
+                </div>
+              </div>
+            ) : fileName ? (
+              <div>
+                <div style={{ fontSize: 28, marginBottom: 4 }}>📄</div>
+                <div style={{ fontWeight: 600, color: "#4F46E5", fontSize: 14 }}>{fileName}</div>
+                <div style={{ color: "#64748B", fontSize: 12, marginTop: 2 }}>Currently attached · Click to replace</div>
+              </div>
+            ) : (
+              <div>
+                <div style={{ fontSize: 28, marginBottom: 8 }}>📁</div>
+                <div style={{ fontWeight: 600, color: "#4F46E5", fontSize: 14 }}>Click to upload a file</div>
+                <div style={{ color: "#94A3B8", fontSize: 12, marginTop: 4 }}>Students will be able to download it</div>
+              </div>
+            )}
+          </div>
+          <input ref={fileRef} type="file" style={{ display: "none" }} onChange={handleFile} />
+          {fileName && (
+            <button onClick={() => { setFile(null); setFileName(null); if (fileRef.current) fileRef.current.value = ""; }} style={{ fontSize: 12, color: "#DC2626", background: "none", border: "none", cursor: "pointer", marginTop: 6 }}>
+              ✕ Remove file
+            </button>
+          )}
+        </div>
+
         <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
           <button className="btn2" onClick={close}>Cancel</button>
           <button className="btn2" onClick={() => setStep(2)}>Edit Questions →</button>
@@ -1870,9 +2000,61 @@ function ViewAssignmentModal({ assignment: a, students, classes, close }) {
   return (<div><div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20 }}><div><span className="bdg" style={{ background: sc(a.subject).bg, color: sc(a.subject).text, marginBottom: 8, display: "inline-flex" }}>{a.subject}</span><div style={{ fontFamily: "Outfit,sans-serif", fontSize: 22, fontWeight: 800, color: "#0F172A" }}>{a.title}</div><div style={{ color: "#64748B", fontSize: 13, marginTop: 4 }}>{cls?.name} · Due {a.due_date}</div></div><button style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: "#94A3B8" }} onClick={close}>✕</button></div>{a.description && <div style={{ background: "#F8FAFF", borderRadius: 10, padding: 14, marginBottom: 16, color: "#475569", fontSize: 14 }}>{a.description}</div>}{a.questions?.length > 0 && <div style={{ marginBottom: 16 }}><div style={{ fontWeight: 600, fontSize: 14, color: "#0F172A", marginBottom: 8 }}>Questions ({a.questions.length})</div>{a.questions.map((q, i) => <div key={q.id} style={{ padding: "8px 12px", background: "#F8FAFF", borderRadius: 8, marginBottom: 6, fontSize: 13 }}><strong>Q{i + 1}:</strong> <MathText text={q.question_text} /> <span style={{ color: "#4F46E5", fontWeight: 600 }}>→ {q.correct_answer}</span></div>)}</div>}<div style={{ fontWeight: 700, fontSize: 14, color: "#0F172A", marginBottom: 10 }}>Assigned to ({as2.length})</div>{as2.map(s => <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: "1px solid #F1F5F9" }}><div className="av" style={{ background: getAC(s.id) }}>{s.avatar || s.name[0]}</div><div style={{ fontWeight: 500, fontSize: 14, color: "#0F172A" }}>{s.name}</div></div>)}<div style={{ marginTop: 20, textAlign: "right" }}><button className="btn2" onClick={close}>Close</button></div></div>);
 }
 
-function AssignmentResultsModal({ assignment: a, students, close }) {
+function GradeSubmissionForm({ sub, totalPoints, onSaved }) {
+  const [score, setScore] = useState(sub.score ?? "");
+  const [total, setTotal] = useState(sub.total_points || totalPoints || 100);
+  const [feedback, setFeedback] = useState(sub.teacher_feedback || "");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+
+  const saveGrade = async () => {
+    const s = Number(score), t = Number(total);
+    if (isNaN(s) || isNaN(t) || t <= 0 || s < 0) { setErr("Enter a valid score and total points."); return; }
+    setSaving(true); setErr("");
+    try {
+      const pct = Math.round((s / t) * 100);
+      await db("submissions", "PATCH", `id=eq.${sub.id}`, {
+        status: "submitted", score: s, total_points: t, percentage: pct,
+        graded_by_teacher: true, graded_at: new Date().toISOString(),
+        teacher_feedback: feedback.trim() || null
+      });
+      await onSaved();
+    } catch (e) { setErr(e.message); }
+    finally { setSaving(false); }
+  };
+
+  return (
+    <div style={{ marginTop: 10, padding: 14, background: "#FFFBEB", border: "1.5px solid #FDE68A", borderRadius: 12 }}>
+      {err && <div className="err" style={{ marginBottom: 8 }}>{err}</div>}
+      {sub.file_url && (
+        <a href={sub.file_url} target="_blank" rel="noopener noreferrer" style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", background: "#fff", borderRadius: 10, marginBottom: 10, textDecoration: "none", border: "1.5px solid #E2E8F0" }}>
+          <span style={{ fontSize: 20 }}>📎</span>
+          <div style={{ color: "#4F46E5", fontWeight: 600, fontSize: 13 }}>{sub.file_name || "View uploaded file"}</div>
+        </a>
+      )}
+      <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
+        <div style={{ flex: 1 }}>
+          <label className="lbl">Score</label>
+          <input className="inp" type="number" min="0" value={score} onChange={e => setScore(e.target.value)} />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label className="lbl">Out of</label>
+          <input className="inp" type="number" min="1" value={total} onChange={e => setTotal(e.target.value)} />
+        </div>
+      </div>
+      <label className="lbl">Feedback (optional)</label>
+      <textarea className="inp" rows={2} value={feedback} onChange={e => setFeedback(e.target.value)} style={{ resize: "vertical", marginBottom: 10 }} />
+      <button className="btn1" onClick={saveGrade} disabled={saving} style={{ width: "100%" }}>
+        {saving ? "Saving…" : sub.graded_by_teacher ? "Update Grade" : "Save Grade"}
+      </button>
+    </div>
+  );
+}
+
+function AssignmentResultsModal({ assignment: a, students, reload, close }) {
   const [expandedSub, setExpandedSub] = useState(null); // student_id whose original submission is expanded
   const [expandedRetake, setExpandedRetake] = useState(null); // retake_session id that's expanded
+  const [gradingFor, setGradingFor] = useState(null); // student_id currently showing the grade form
   if (!a) return null;
   const subs = a.submissions || [];
   const retakes = a.retakeSessions || [];
@@ -1903,7 +2085,7 @@ function AssignmentResultsModal({ assignment: a, students, close }) {
     </div>
   );
 
-  return (<div><div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}><div><div style={{ fontFamily: "Outfit,sans-serif", fontSize: 20, fontWeight: 800, color: "#0F172A" }}>{a.title} — Results</div><div style={{ color: "#64748B", fontSize: 13 }}>{a.questions?.length || 0} questions · {subs.length} submissions</div></div><button style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: "#94A3B8" }} onClick={close}>✕</button></div>{studentIds.length === 0 && <div style={{ textAlign: "center", padding: 32, color: "#94A3B8" }}>No submissions yet.</div>}{studentIds.map(sid => {
+  return (<div><div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}><div><div style={{ display: "flex", alignItems: "center", gap: 10 }}><div style={{ fontFamily: "Outfit,sans-serif", fontSize: 20, fontWeight: 800, color: "#0F172A" }}>{a.title} — Results</div><span className="bdg" style={{ background: a.requires_upload ? "#FEF3C7" : "#D1FAE5", color: a.requires_upload ? "#D97706" : "#059669", fontSize: 11 }}>{a.requires_upload ? "Teacher Graded" : "Auto Graded"}</span></div><div style={{ color: "#64748B", fontSize: 13 }}>{a.questions?.length || 0} questions · {subs.length} submissions</div></div><button style={{ background: "none", border: "none", fontSize: 20, cursor: "pointer", color: "#94A3B8" }} onClick={close}>✕</button></div>{studentIds.length === 0 && <div style={{ textAlign: "center", padding: 32, color: "#94A3B8" }}>No submissions yet.</div>}{studentIds.map(sid => {
     const st = students.find(s => s.id === sid);
     const sub = subs.find(s => s.student_id === sid);
     const myRetakes = retakes.filter(r => r.student_id === sid).sort((x, y) => x.attempt_number - y.attempt_number);
@@ -1923,13 +2105,41 @@ function AssignmentResultsModal({ assignment: a, students, close }) {
               {sub && <span style={{ color: "#4F46E5", marginLeft: 6 }}>{subExpanded ? "▲ Hide answers" : "▼ View answers"}</span>}
             </div>
           </div>
-          {sub && (
+          {sub && sub.status === "pending_review" ? (
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: "#D97706" }}>⏳ Under Review</div>
+              <button
+                className="btn1" style={{ fontSize: 12, padding: "5px 12px", marginTop: 4 }}
+                onClick={e => { e.stopPropagation(); setGradingFor(gradingFor === sid ? null : sid); }}
+              >
+                Grade →
+              </button>
+            </div>
+          ) : sub && (
             <div style={{ textAlign: "right" }}>
               <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 22, fontWeight: 800, color: pct >= 70 ? "#059669" : pct >= 50 ? "#D97706" : "#DC2626" }}>{pct}%</div>
               <div style={{ fontSize: 12, color: "#64748B" }}>{sub.score}/{sub.total_points} pts</div>
+              {sub.graded_by_teacher && (
+                <button
+                  className="btn2" style={{ fontSize: 11, padding: "3px 10px", marginTop: 4 }}
+                  onClick={e => { e.stopPropagation(); setGradingFor(gradingFor === sid ? null : sid); }}
+                >
+                  Edit Grade
+                </button>
+              )}
             </div>
           )}
         </div>
+
+        {gradingFor === sid && sub && (
+          <div style={{ marginLeft: 54 }}>
+            <GradeSubmissionForm
+              sub={sub}
+              totalPoints={a.questions?.length || 100}
+              onSaved={async () => { await reload(); setGradingFor(null); }}
+            />
+          </div>
+        )}
 
         {subExpanded && sub && (
           <div style={{ marginLeft: 54 }}>
@@ -2061,6 +2271,9 @@ const [loadingTopics, setLoadingTopics] = useState(false);
         ? { label: "View Results →", color: "#059669", bg: "#D1FAE5" }
         : { label: "View Assignment →", color: "#475569", bg: "#F1F5F9" };
     }
+    if (status === "pending_review") {
+      return { label: "View Submission →", color: "#D97706", bg: "#FEF3C7" };
+    }
     if (status === "in_progress") {
       return { label: hasQ ? "Resume →" : "View Assignment →", color: "#D97706", bg: "#FEF3C7" };
     }
@@ -2070,6 +2283,7 @@ const [loadingTopics, setLoadingTopics] = useState(false);
 
   const statusBadge = (() => {
     if (status === "submitted") return { text: "Submitted ✓", color: "#059669" };
+    if (status === "pending_review") return { text: "Under Review ⏳", color: "#D97706" };
     if (status === "in_progress") return { text: "In Progress", color: "#D97706" };
     return { text: d <= 0 ? "Past due!" : `Due in ${d}d`, color: d <= 2 ? "#DC2626" : "#64748B" };
   })();
@@ -2677,14 +2891,19 @@ function QuizInterface({ assignment, student, session, onClose }) {
   const [retakeAttempt, setRetakeAttempt] = useState(1);
   const [retaking, setRetaking] = useState(false);
   const [video, setVideo] = useState(null);
-  const alreadySubmitted = assignment.submission?.status === "submitted";
+  const [workFile, setWorkFile] = useState(null);
+  const [workFileName, setWorkFileName] = useState(assignment.submission?.file_name || null);
+  const workFileRef = useRef(null);
+  const alreadySubmitted = assignment.submission?.status === "submitted" || assignment.submission?.status === "pending_review";
 
   const grade = student.grade;
   const subject = assignment.subject;
   const topic = assignment.topic;
+  const needsUpload = !!assignment.requires_upload;
 
-  // Auto-graded = every question is multiple choice or true/false (i.e. gradable by the system)
-  const isAutoGraded = questions.length > 0 && questions.every(
+  // Auto-graded = every question is MC/TF AND the assignment doesn't require a manual-review upload.
+  // If requires_upload is set, the WHOLE assignment is teacher-graded, even with MC/TF questions mixed in.
+  const isAutoGraded = !needsUpload && questions.length > 0 && questions.every(
     q => q.question_type === "multiple_choice" || q.question_type === "true_false"
   );
   // Retake only makes sense if the assignment is linked to a topic in the question library
@@ -2716,7 +2935,16 @@ function QuizInterface({ assignment, student, session, onClose }) {
           // If already submitted, load result
           if (alreadySubmitted) {
             setSubmitted(true);
-            setResult(assignment.submission);
+            const sub = assignment.submission;
+            if (sub.status === "pending_review") {
+              setResult({ pending: true, fileUrl: sub.file_url, fileName: sub.file_name });
+            } else {
+              setResult({
+                score: sub.score, total_points: sub.total_points, percentage: sub.percentage,
+                feedback: sub.teacher_feedback, graded: sub.graded_by_teacher,
+                fileUrl: sub.file_url, fileName: sub.file_name
+              });
+            }
           }
         }
         // Load the linked video for this topic, if any
@@ -2758,6 +2986,14 @@ function QuizInterface({ assignment, student, session, onClose }) {
 
   // FIX 1: use saveAnswer() + saveSubmission() with correct on_conflict
   const submit = async () => {
+    if (needsUpload && !workFile && !assignment.submission?.file_url) {
+      alert("Please upload your completed work before submitting.");
+      return;
+    }
+    if (needsUpload && questions.length > 0 && Object.keys(answers).filter(k => answers[k]).length < questions.length) {
+      alert("Please answer all questions before submitting.");
+      return;
+    }
     if (!confirm("Submit your answers? You cannot change them after submitting.")) return;
     setSubmitting(true);
     try {
@@ -2779,6 +3015,29 @@ function QuizInterface({ assignment, student, session, onClose }) {
           status: "submitted", score, total_points: total, percentage: pct
         });
         setResult({ score, total_points: total, percentage: pct });
+      } else if (needsUpload) {
+        // Teacher-graded: save any MC/TF answers for reference, upload the student's
+        // work, and mark the submission as pending review — no auto score shown yet.
+        if (total > 0) {
+          await Promise.all(questions.map(q => {
+            const selected = answers[q.id];
+            const correct = selected?.toLowerCase() === q.correct_answer?.toLowerCase();
+            if (correct) score++;
+            return saveAnswer(student.studentId, assignment.id, q.id, selected || null, correct);
+          }));
+        }
+        let fileUrl = assignment.submission?.file_url || null;
+        let fName = assignment.submission?.file_name || null;
+        if (workFile) {
+          fileUrl = await uploadFile(workFile, student.studentId, assignment.id);
+          fName = workFile.name;
+        }
+        await saveSubmission(student.studentId, assignment.id, {
+          status: "pending_review", score, total_points: total, percentage: null,
+          file_url: fileUrl, file_name: fName,
+          submitted_at: new Date().toISOString()
+        });
+        setResult({ pending: true, fileUrl, fileName: fName });
       } else {
         // Save all answers with is_correct flag
         await Promise.all(questions.map(q => {
@@ -2823,6 +3082,85 @@ function QuizInterface({ assignment, student, session, onClose }) {
   };
 
   const answered = Object.keys(answers).filter(k => answers[k]).length;
+
+  // Shared upload + submit UI for teacher-graded assignments (used both when there
+  // are zero MC/TF questions, and mixed in with the full quiz view below).
+  const renderUploadAndSubmit = () => {
+    if (submitted && result) {
+      if (result.pending) {
+        return (
+          <div className="fade" style={{ background: "linear-gradient(135deg,#D97706,#B45309)", borderRadius: 20, padding: 32, marginBottom: 16, textAlign: "center", color: "#fff" }}>
+            <div style={{ fontSize: 44, marginBottom: 8 }}>⏳</div>
+            <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 22, fontWeight: 800 }}>Under Review</div>
+            <div style={{ fontSize: 14, marginTop: 6, opacity: 0.9 }}>Your teacher hasn't graded this yet. You'll see your score here once it's reviewed.</div>
+            {result.fileName && (
+              <div style={{ marginTop: 14, fontSize: 13, background: "rgba(255,255,255,0.15)", borderRadius: 8, padding: "6px 14px", display: "inline-block" }}>
+                📎 Submitted: {result.fileName}
+              </div>
+            )}
+          </div>
+        );
+      }
+      // Graded (teacher-graded, now finalized)
+      const pct = result.percentage ?? 0;
+      return (
+        <div className="fade" style={{ background: pct >= 70 ? "linear-gradient(135deg,#059669,#047857)" : pct >= 50 ? "linear-gradient(135deg,#D97706,#B45309)" : "linear-gradient(135deg,#DC2626,#B91C1C)", borderRadius: 20, padding: 32, marginBottom: 16, textAlign: "center", color: "#fff" }}>
+          <div style={{ fontSize: 44, marginBottom: 8 }}>{pct >= 70 ? "🏆" : pct >= 50 ? "👍" : "📚"}</div>
+          <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 44, fontWeight: 800 }}>{pct}%</div>
+          <div style={{ fontSize: 16, marginTop: 4, opacity: 0.9 }}>{result.score}/{result.total_points} points · Graded by your teacher</div>
+          {result.feedback && (
+            <div style={{ marginTop: 14, fontSize: 13, background: "rgba(255,255,255,0.15)", borderRadius: 10, padding: "10px 16px", textAlign: "left" }}>
+              <strong>Feedback:</strong> {result.feedback}
+            </div>
+          )}
+          {result.fileName && (
+            <div style={{ marginTop: 10, fontSize: 12, opacity: 0.85 }}>📎 {result.fileName}</div>
+          )}
+        </div>
+      );
+    }
+    // Not yet submitted — upload widget
+    return (
+      <div className="fade" style={{ marginBottom: 16 }}>
+        <div style={{ fontWeight: 700, fontSize: 14, color: "#0F172A", marginBottom: 8 }}>Upload your completed work</div>
+        <div
+          onClick={() => workFileRef.current.click()}
+          style={{ border: "2px dashed #C7D2FE", borderRadius: 14, padding: "22px 18px", textAlign: "center", cursor: "pointer", background: "#F8FAFF" }}
+        >
+          <div style={{ fontSize: 28 }}>📎</div>
+          <div style={{ color: "#4F46E5", fontWeight: 700, fontSize: 14, marginTop: 6 }}>{workFileName || "Click to choose a file (photo, PDF, doc)"}</div>
+          <div style={{ color: "#94A3B8", fontSize: 12, marginTop: 2 }}>{workFileName ? "Click to change" : "Take a photo of your work or upload a document"}</div>
+        </div>
+        <input
+          ref={workFileRef} type="file" accept="image/*,.pdf,.doc,.docx" style={{ display: "none" }}
+          onChange={e => { const f = e.target.files?.[0]; if (f) { setWorkFile(f); setWorkFileName(f.name); } }}
+        />
+        {(() => {
+          const allAnswered = questions.length === 0 || answered === questions.length;
+          const hasFile = !!(workFile || assignment.submission?.file_url);
+          const canSubmit = allAnswered && hasFile;
+          return (
+            <>
+              <button
+                className="btn1" onClick={submit} disabled={submitting || !canSubmit}
+                style={{ width: "100%", marginTop: 14, padding: "14px", fontSize: 14, opacity: canSubmit ? 1 : 0.5, cursor: canSubmit ? "pointer" : "not-allowed" }}
+              >
+                {submitting ? "Submitting…" : "Submit for Grading →"}
+              </button>
+              {!canSubmit && (
+                <div style={{ fontSize: 12, color: "#94A3B8", marginTop: 8, textAlign: "center" }}>
+                  {!allAnswered && !hasFile ? `Answer all questions and upload your work to submit.`
+                    : !allAnswered ? `${answered}/${questions.length} answered — answer all questions to submit.`
+                    : `Upload your completed work to submit.`}
+                </div>
+              )}
+            </>
+          );
+        })()}
+      </div>
+    );
+  };
+
   const header = (
     <div style={{ background: "linear-gradient(135deg,#0F172A,#1E1B4B)", padding: "16px 32px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 10 }}>
       <div>
@@ -2866,6 +3204,20 @@ function QuizInterface({ assignment, student, session, onClose }) {
                 {assignment.description}
               </div>
             )}
+            {video && getYouTubeId(video.youtube_url) && (
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontWeight: 700, fontSize: 14, color: "#0F172A", marginBottom: 8 }}>
+                  📺 {video.title || "Watch this video"}
+                </div>
+                <div style={{ borderRadius: 14, overflow: "hidden", aspectRatio: "16/9" }}>
+                  <iframe
+                    width="100%" height="100%"
+                    src={`https://www.youtube.com/embed/${getYouTubeId(video.youtube_url)}`}
+                    title={video.title || "Lesson video"} frameBorder="0" allowFullScreen
+                  />
+                </div>
+              </div>
+            )}
             {assignment.file_url ? (
   // Has real stored file — show download link
   <a
@@ -2901,9 +3253,10 @@ function QuizInterface({ assignment, student, session, onClose }) {
   </div>
 ) : null}
 
-            {!assignment.description && !assignment.file_name && (
+            {!assignment.description && !assignment.file_name && !video && (
               <div style={{ color: "#94A3B8", textAlign: "center", padding: "20px 0" }}>No additional details for this assignment.</div>
             )}
+            {needsUpload && renderUploadAndSubmit()}
             <div style={{ marginTop: 20, display: "flex", justifyContent: "center" }}>
               <button className="btn2" onClick={onClose}>← Back to Assignments</button>
             </div>
@@ -2925,8 +3278,8 @@ function QuizInterface({ assignment, student, session, onClose }) {
       )}
 
       <div style={{ maxWidth: 720, margin: "0 auto", padding: "32px 20px" }}>
-        {/* Score banner after submission */}
-        {submitted && result && (
+        {/* Score banner after submission (auto-graded) or Under Review / Graded banner (teacher-graded) */}
+        {needsUpload ? (submitted && renderUploadAndSubmit()) : (submitted && result && (
           <div className="fade" style={{ background: result.percentage >= 70 ? "linear-gradient(135deg,#059669,#047857)" : result.percentage >= 50 ? "linear-gradient(135deg,#D97706,#B45309)" : "linear-gradient(135deg,#DC2626,#B91C1C)", borderRadius: 20, padding: 32, marginBottom: 32, textAlign: "center", color: "#fff" }}>
             <div style={{ fontSize: 48, marginBottom: 8 }}>{result.percentage >= 70 ? "🏆" : result.percentage >= 50 ? "👍" : "📚"}</div>
             <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 48, fontWeight: 800 }}>{result.percentage}%</div>
@@ -2935,7 +3288,7 @@ function QuizInterface({ assignment, student, session, onClose }) {
               {result.percentage >= 70 ? "Great job! 🌟" : result.percentage >= 50 ? "Good effort! Review the answers below." : "Keep practicing — you'll get there! 💪"}
             </div>
           </div>
-        )}
+        ))}
 
         {/* Linked video — shown before attempting (and before a retake) */}
         {!submitted && video && getYouTubeId(video.youtube_url) && (
@@ -2951,6 +3304,32 @@ function QuizInterface({ assignment, student, session, onClose }) {
               />
             </div>
           </div>
+        )}
+
+        {/* Attached worksheet/reference file — shown alongside the questions */}
+        {!submitted && assignment.file_url && (
+          <a
+            href={assignment.file_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            download={assignment.file_name}
+            style={{
+              display: "flex", alignItems: "center", gap: 12,
+              padding: "14px 18px", background: "#EEF2FF",
+              borderRadius: 12, marginBottom: 24,
+              textDecoration: "none", border: "2px solid #C7D2FE",
+              transition: "all 0.18s"
+            }}
+            onMouseEnter={e => e.currentTarget.style.background = "#E0E7FF"}
+            onMouseLeave={e => e.currentTarget.style.background = "#EEF2FF"}
+          >
+            <span style={{ fontSize: 26 }}>📎</span>
+            <div style={{ flex: 1 }}>
+              <div style={{ color: "#4F46E5", fontWeight: 700, fontSize: 14 }}>{assignment.file_name}</div>
+              <div style={{ color: "#818CF8", fontSize: 12, marginTop: 2 }}>Click to open / download</div>
+            </div>
+            <span style={{ fontSize: 20 }}>⬇️</span>
+          </a>
         )}
 
         {/* Questions */}
@@ -3007,7 +3386,8 @@ function QuizInterface({ assignment, student, session, onClose }) {
         })}
 
         {/* Submit / Back buttons */}
-        {!submitted && (
+        {!submitted && needsUpload && renderUploadAndSubmit()}
+        {!submitted && !needsUpload && (
           <div style={{ textAlign: "center", marginTop: 24 }}>
             <button className="btn1" onClick={submit} disabled={submitting || answered === 0} style={{ padding: "14px 48px", fontSize: 16 }}>
               {submitting ? "Grading your answers…" : `Submit Assignment (${answered}/${questions.length} answered)`}
