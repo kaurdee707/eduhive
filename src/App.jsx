@@ -22,6 +22,43 @@ async function db(table, method = "GET", filter = "", body = null) {
   return text ? JSON.parse(text) : null;
 }
 
+// Re-point a per-teacher student row's login link to a different account (used
+// for merging two accounts that turned out to be the same real student).
+// Upsert on student_id, since one student row can only ever link to one login.
+async function linkStudentToAccount(studentAccountId, studentId) {
+  const url = `${SB_URL}/rest/v1/student_account_links?on_conflict=student_id`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      apikey: SB_KEY, Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation,resolution=merge-duplicates"
+    },
+    body: JSON.stringify({ student_account_id: studentAccountId, student_id: studentId })
+  });
+  const text = await res.text();
+  if (!res.ok) { let m; try { m = JSON.parse(text).message; } catch { m = text; } throw new Error(m || "Failed to link"); }
+  return text ? JSON.parse(text) : null;
+}
+
+// Merge: re-point the duplicate's per-teacher row onto the primary's login.
+// If the duplicate's OLD account ends up with zero remaining links after
+// that, retire its login (clear auth_user_id) so there isn't a second,
+// orphaned way to log in as the same real student.
+async function mergeStudentAccounts(primaryAccountId, duplicateStudentId) {
+  const existingLink = await db("student_account_links", "GET", `student_id=eq.${duplicateStudentId}`);
+  const oldAccountId = existingLink?.[0]?.student_account_id || null;
+
+  await linkStudentToAccount(primaryAccountId, duplicateStudentId);
+
+  if (oldAccountId && oldAccountId !== primaryAccountId) {
+    const remaining = await db("student_account_links", "GET", `student_account_id=eq.${oldAccountId}`);
+    if (!remaining || remaining.length === 0) {
+      await db("student_accounts", "PATCH", `id=eq.${oldAccountId}`, { auth_user_id: null });
+    }
+  }
+}
+
 async function upsertDB(table, body) {
   const url = `${SB_URL}/rest/v1/${table}`;
   const res = await fetch(url, {
@@ -254,6 +291,24 @@ async function sbSignOut() {
   await fetch(`${SB_URL}/auth/v1/logout`, { method: "POST", headers: { apikey: SB_KEY, Authorization: `Bearer ${TOKEN}` } });
 }
 
+// Look up a logged-in teacher's own row to determine role (teacher/admin) and
+// whether their account has been disabled — checked at login and on session restore.
+async function getTeacherAccountStatus(uid) {
+  const rows = await db("teachers", "GET", `id=eq.${uid}&select=id,name,email,role,active`);
+  return rows?.[0] || null;
+}
+
+// Admin: full list of every teacher and every student across the deployment
+async function loadAdminData() {
+  const [teachers, students, links, accounts] = await Promise.all([
+    db("teachers", "GET", `order=created_at.asc`),
+    db("students", "GET", `order=name.asc`),
+    db("student_account_links", "GET", ""),
+    db("student_accounts", "GET", `select=id,username`)
+  ]);
+  return { teachers, students, links, accounts };
+}
+
 async function loadTeacherData(uid) {
   const [classes, students, assignments] = await Promise.all([
     db("classes", "GET", `teacher_id=eq.${uid}&order=created_at.asc`),
@@ -262,30 +317,66 @@ async function loadTeacherData(uid) {
   ]);
   const cids = classes.map(c => c.id).join(",");
   const aids = assignments.map(a => a.id).join(",");
-  const [cs, as2, questions, accts, subs, retakeSessions, studentAnswers] = await Promise.all([
+  const [cs, as2, questions, accts, subs, retakeSessions, studentAnswers, links] = await Promise.all([
     cids ? db("class_students", "GET", `class_id=in.(${cids})`) : Promise.resolve([]),
     aids ? db("assignment_students", "GET", `assignment_id=in.(${aids})`) : Promise.resolve([]),
     aids ? db("questions", "GET", `assignment_id=in.(${aids})&order=order_index.asc`) : Promise.resolve([]),
-    db("student_accounts", "GET", `select=student_id,invite_token,invite_accepted,auth_user_id,student_name`),
+    db("student_accounts", "GET", `select=id,student_id,invite_token,invite_accepted,auth_user_id,student_name,username`),
     aids ? db("submissions", "GET", `assignment_id=in.(${aids})`) : Promise.resolve([]),
     aids ? db("retake_sessions", "GET", `assignment_id=in.(${aids})&order=attempt_number.asc`) : Promise.resolve([]),
-    aids ? db("student_answers", "GET", `assignment_id=in.(${aids})`) : Promise.resolve([])
+    aids ? db("student_answers", "GET", `assignment_id=in.(${aids})`) : Promise.resolve([]),
+    db("student_account_links", "GET", "") // RLS already scopes this to links involving the teacher's own students
   ]);
+  // A student's account may be the legacy direct student_id match, OR reached
+  // via student_account_links (e.g. they were linked to an account created by
+  // a different teacher). Check both so "has an account" shows correctly either way.
+  const findAccount = studentId => {
+    const link = links.find(l => l.student_id === studentId);
+    if (link) return accts.find(a => a.id === link.student_account_id);
+    return accts.find(a => a.student_id === studentId);
+  };
   return {
     classes: classes.map(c => ({ ...c, subjects: c.subjects || [], students: cs.filter(x => x.class_id === c.id).map(x => x.student_id) })),
-    students: students.map(s => ({ ...s, classes: cs.filter(x => x.student_id === s.id).map(x => x.class_id), account: accts.find(a => a.student_id === s.id) })),
+    students: students.map(s => ({ ...s, classes: cs.filter(x => x.student_id === s.id).map(x => x.class_id), account: findAccount(s.id) })),
     assignments: assignments.map(a => ({ ...a, assignedTo: as2.filter(x => x.assignment_id === a.id).map(x => x.student_id), questions: questions.filter(q => q.assignment_id === a.id), submissions: subs.filter(s => s.assignment_id === a.id), retakeSessions: retakeSessions.filter(rs => rs.assignment_id === a.id), studentAnswers: studentAnswers.filter(sa => sa.assignment_id === a.id) }))
   };
 }
 
-async function loadStudentData(authUserId) {
+// Resolve every teacher-relationship this login is linked to (one login, many
+// teachers). Falls back to the account's legacy single student_id if the link
+// table hasn't been backfilled for some reason.
+async function getLinkedStudentProfiles(authUserId) {
   const accounts = await db("student_accounts", "GET", `auth_user_id=eq.${authUserId}&select=*`);
   if (!accounts?.length) throw new Error("Student account not found");
   const acct = accounts[0];
-  const sid = acct.student_id;
 
+  const links = await db("student_account_links", "GET", `student_account_id=eq.${acct.id}`);
+  let studentIds = (links || []).map(l => l.student_id);
+  if (studentIds.length === 0 && acct.student_id) studentIds = [acct.student_id];
+  if (studentIds.length === 0) throw new Error("Student account not found");
+
+  const idList = studentIds.join(",");
+  const studentRows = await db("students", "GET", `id=in.(${idList})`);
+  const teacherIds = [...new Set(studentRows.map(s => s.teacher_id))].join(",");
+  const teacherRows = teacherIds ? await db("teachers", "GET", `id=in.(${teacherIds})&select=id,name`) : [];
+
+  return studentRows.map(s => ({
+    studentId: s.id,
+    name: s.name,
+    grade: s.grade,
+    avatar: s.avatar,
+    active: s.active !== false,
+    teacherId: s.teacher_id,
+    teacherName: teacherRows.find(t => t.id === s.teacher_id)?.name || "Unknown Teacher"
+  }));
+}
+
+// Load one teacher-relationship's full dashboard (classes/assignments/etc).
+// This is the same logic loadStudentData used to do directly — now
+// parameterized so a student can switch between teachers without re-logging in.
+async function loadStudentDashboardData(sid) {
   const studentRows = await db("students", "GET", `id=eq.${sid}`);
-  const student = studentRows?.[0] || { id: sid, name: acct.student_name || "Student" };
+  const student = studentRows?.[0] || { id: sid, name: "Student" };
 
   const [cs, as2] = await Promise.all([
     db("class_students", "GET", `student_id=eq.${sid}`),
@@ -300,7 +391,6 @@ async function loadStudentData(authUserId) {
     assignmentIds ? db("assignments", "GET", `id=in.(${assignmentIds})&order=created_at.desc`) : Promise.resolve([]),
     assignmentIds ? db("submissions", "GET", `student_id=eq.${sid}`) : Promise.resolve([]),
     assignmentIds ? db("student_answers", "GET", `student_id=eq.${sid}`) : Promise.resolve([]),
-    // ✅ FIX: load questions so the Start button appears
     assignmentIds ? db("questions", "GET", `assignment_id=in.(${assignmentIds})&order=order_index.asc`) : Promise.resolve([]),
     assignmentIds ? db("retake_sessions", "GET", `student_id=eq.${sid}`) : Promise.resolve([])
   ]);
@@ -312,16 +402,35 @@ async function loadStudentData(authUserId) {
       const attempts = retakeSessions
         .filter(rs => rs.assignment_id === a.id)
         .sort((x, y) => x.attempt_number - y.attempt_number);
-      // "Current" session: an unfinished retake takes priority; otherwise the latest one
       const current = attempts.find(rs => rs.status === "in_progress") || attempts[attempts.length - 1] || null;
       return {
         ...a,
         submission: submissions.find(s => s.assignment_id === a.id) || null,
         savedAnswers: savedAnswers.filter(sa => sa.assignment_id === a.id),
-        questions: questions.filter(q => q.assignment_id === a.id),  // ✅ FIX: attach questions
+        questions: questions.filter(q => q.assignment_id === a.id),
         retakeSession: current
       };
     })
+  };
+}
+
+// Full login-time load: resolve every linked teacher-relationship, then load
+// the dashboard for the preferred (or first active) one. Kept as the same
+// function signature used everywhere so login/session-restore code is unchanged.
+async function loadStudentData(authUserId, preferredStudentId = null) {
+  const profiles = await getLinkedStudentProfiles(authUserId);
+  const activeProfiles = profiles.filter(p => p.active);
+  const pick =
+    (preferredStudentId && profiles.find(p => p.studentId === preferredStudentId && p.active)) ||
+    activeProfiles[0] || profiles[0];
+  if (!pick) throw new Error("Student account not found");
+
+  const dash = await loadStudentDashboardData(pick.studentId);
+  return {
+    ...dash,
+    student: { ...dash.student, active: pick.active },
+    linkedProfiles: profiles,
+    selectedStudentId: pick.studentId
   };
 }
 
@@ -338,6 +447,8 @@ const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700;800&family=Inter:wght@400;500;600&display=swap');
 *{box-sizing:border-box;margin:0;padding:0;}
 ::-webkit-scrollbar{width:6px} ::-webkit-scrollbar-thumb{background:#C7D2E8;border-radius:3px}
+.no-copy{user-select:none;-webkit-user-select:none;-moz-user-select:none;}
+.no-copy img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 .ni{display:flex;align-items:center;gap:10px;padding:10px 16px;border-radius:10px;cursor:pointer;transition:all 0.18s;color:#94A3B8;font-size:14px;font-weight:500}
 .ni:hover{background:rgba(255,255,255,0.08);color:#E2E8F0} .ni.on{background:rgba(79,70,229,0.3);color:#fff;font-weight:600}
 .card{background:#fff;border-radius:16px;padding:24px;box-shadow:0 1px 4px rgba(0,0,0,0.06)}
@@ -528,9 +639,22 @@ function AuthScreen({ onLogin }) {
         const studentAccts = await db("student_accounts", "GET", `auth_user_id=eq.${res.user.id}`);
         if (studentAccts?.length) {
           const data = await loadStudentData(res.user.id);
+          if (data.student.active === false) {
+            await sbSignOut(); TOKEN = SB_KEY;
+            throw new Error("This account has been disabled. Contact your teacher or administrator.");
+          }
           onLogin({ type: "student", session: res, data });
         } else {
+          const status = await getTeacherAccountStatus(res.user.id);
+          if (status && status.active === false) {
+            await sbSignOut(); TOKEN = SB_KEY;
+            throw new Error("This account has been disabled. Contact your administrator.");
+          }
           const data = await loadTeacherData(res.user.id);
+          if (status?.role === "admin") {
+            const adminData = await loadAdminData();
+            data.isAdmin = true; data.allTeachers = adminData.teachers; data.allStudentsGlobal = adminData.students; data.allLinks = adminData.links; data.allAccounts = adminData.accounts;
+          }
           onLogin({ type: "teacher", session: res, data });
         }
       }
@@ -582,6 +706,10 @@ function AuthScreen({ onLogin }) {
 
       TOKEN = res.access_token;
       const data = await loadStudentData(res.user.id);
+      if (data.student.active === false) {
+        await sbSignOut(); TOKEN = SB_KEY;
+        throw new Error("This account has been disabled. Contact your teacher or administrator.");
+      }
       onLogin({ type: "student", session: res, data });
 
     } catch (e) { setError(e.message); }
@@ -668,9 +796,23 @@ export default function TutoringApp() {
         const res = await sbRefreshSession(saved.refresh_token);
         if (!res._ok || !res.access_token) throw new Error("Session expired");
         TOKEN = res.access_token;
-        persistSession(res, saved.type);
-        const data = saved.type === "student" ? await loadStudentData(res.user.id) : await loadTeacherData(res.user.id);
-        setAppUser({ type: saved.type, session: res, data });
+        let type = saved.type;
+        let data;
+        if (type === "student") {
+          data = await loadStudentData(res.user.id);
+          if (data.student.active === false) throw new Error("Account disabled");
+        } else {
+          const status = await getTeacherAccountStatus(res.user.id);
+          if (status && status.active === false) throw new Error("Account disabled");
+          type = "teacher";
+          data = await loadTeacherData(res.user.id);
+          if (status?.role === "admin") {
+            const adminData = await loadAdminData();
+            data.isAdmin = true; data.allTeachers = adminData.teachers; data.allStudentsGlobal = adminData.students; data.allLinks = adminData.links; data.allAccounts = adminData.accounts;
+          }
+        }
+        persistSession(res, type);
+        setAppUser({ type, session: res, data });
       } catch (e) {
         sessionStorage.removeItem(SESSION_KEY);
       } finally {
@@ -699,6 +841,203 @@ export default function TutoringApp() {
 }
 
 // ── Teacher App ───────────────────────────────────────────────────────────────
+// ── Admin App ──────────────────────────────────────────────────────────────────
+// ── Admin views (rendered inside TeacherApp when the logged-in teacher is also an admin) ──
+function ManageTeachersView({ allTeachers, me, busy, toggleTeacherActive, toggleTeacherRole }) {
+  return (
+    <div>
+      <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 24, fontWeight: 800, color: "#0F172A", marginBottom: 4 }}>Teachers</div>
+      <div style={{ color: "#64748B", fontSize: 14, marginBottom: 20 }}>{allTeachers.length} teacher account{allTeachers.length !== 1 ? "s" : ""}</div>
+      <div className="card" style={{ padding: 0, overflow: "hidden" }}>
+        {allTeachers.map((t, i) => (
+          <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 14, padding: "16px 20px", borderBottom: i < allTeachers.length - 1 ? "1px solid #F1F5F9" : "none" }}>
+            <div className="av" style={{ background: getAC(t.id) }}>{t.name?.[0] || "?"}</div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: 600, fontSize: 14, color: "#0F172A" }}>{t.name}{t.id === me && <span style={{ color: "#94A3B8", fontWeight: 400 }}> (you)</span>}</div>
+              <div style={{ fontSize: 12, color: "#64748B" }}>{t.email}</div>
+            </div>
+            <span className="bdg" style={{ background: t.role === "admin" ? "#EDE9FE" : "#F1F5F9", color: t.role === "admin" ? "#7C3AED" : "#475569" }}>{t.role === "admin" ? "Admin" : "Teacher"}</span>
+            <span className="bdg" style={{ background: t.active ? "#D1FAE5" : "#FEE2E2", color: t.active ? "#059669" : "#DC2626" }}>{t.active ? "Active" : "Disabled"}</span>
+            <button className="btn2" style={{ fontSize: 12, padding: "6px 12px" }} disabled={busy === t.id} onClick={() => toggleTeacherRole(t)}>
+              {t.role === "admin" ? "Remove Admin" : "Make Admin"}
+            </button>
+            <button className={t.active ? "btnd" : "btng"} style={{ fontSize: 12 }} disabled={busy === t.id} onClick={() => toggleTeacherActive(t)}>
+              {t.active ? "Disable" : "Enable"}
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function MergeStudentsPanel({ allStudentsGlobal, allTeachers, allLinks, reload }) {
+  const [open, setOpen] = useState(false);
+  const [aId, setAId] = useState("");
+  const [bId, setBId] = useState("");
+  const [primary, setPrimary] = useState("a");
+  const [merging, setMerging] = useState(false);
+  const [err, setErr] = useState("");
+  const [done, setDone] = useState(false);
+
+  const teacherName = tid => allTeachers.find(t => t.id === tid)?.name || "—";
+  const a = allStudentsGlobal.find(s => s.id === aId);
+  const b = allStudentsGlobal.find(s => s.id === bId);
+  const accountIdFor = studentId => (allLinks || []).find(l => l.student_id === studentId)?.student_account_id || null;
+  const alreadyLinked = a && b && accountIdFor(a.id) && accountIdFor(a.id) === accountIdFor(b.id);
+
+  const reset = () => { setAId(""); setBId(""); setPrimary("a"); setErr(""); setDone(false); };
+
+  const merge = async () => {
+    if (!a || !b || a.id === b.id) { setErr("Pick two different students to merge."); return; }
+    if (alreadyLinked) { setErr("These two students already share the same login."); return; }
+    setErr(""); setMerging(true);
+    try {
+      const primaryStudent = primary === "a" ? a : b;
+      const duplicateStudent = primary === "a" ? b : a;
+      const primaryLink = await db("student_account_links", "GET", `student_id=eq.${primaryStudent.id}`);
+      const primaryAccountId = primaryLink?.[0]?.student_account_id;
+      if (!primaryAccountId) throw new Error("The student you picked to keep doesn't have a login yet — invite them first, then merge.");
+      await mergeStudentAccounts(primaryAccountId, duplicateStudent.id);
+      setDone(true);
+      await reload();
+    } catch (e) { setErr(e.message); }
+    finally { setMerging(false); }
+  };
+
+  return (
+    <div className="card" style={{ marginBottom: 20 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }} onClick={() => { setOpen(!open); if (open) reset(); }}>
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 15, color: "#0F172A" }}>🔗 Merge Duplicate Students</div>
+          <div style={{ fontSize: 12, color: "#64748B", marginTop: 2 }}>Two different-looking student rows turned out to be the same real kid? Merge their logins here.</div>
+        </div>
+        <span style={{ fontSize: 18, color: "#94A3B8" }}>{open ? "▲" : "▼"}</span>
+      </div>
+
+      {open && (
+        <div style={{ marginTop: 16, borderTop: "1px solid #F1F5F9", paddingTop: 16 }}>
+          {err && <div className="err" style={{ marginBottom: 12 }}>{err}</div>}
+          {done ? (
+            <div style={{ textAlign: "center", padding: 12 }}>
+              <div style={{ fontSize: 32, marginBottom: 8 }}>✅</div>
+              <div style={{ fontWeight: 700, color: "#0F172A", marginBottom: 4 }}>Merged successfully</div>
+              <div style={{ fontSize: 13, color: "#64748B", marginBottom: 14 }}>
+                The student now logs in with the credentials of the account you kept. The other login has been retired.
+              </div>
+              <button className="btn2" onClick={reset}>Merge another pair</button>
+            </div>
+          ) : (
+            <>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 }}>
+                <div>
+                  <label className="lbl">Student A</label>
+                  <select className="sel" value={aId} onChange={e => setAId(e.target.value)}>
+                    <option value="">Select…</option>
+                    {allStudentsGlobal.map(s => <option key={s.id} value={s.id}>{s.name} — {teacherName(s.teacher_id)}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="lbl">Student B</label>
+                  <select className="sel" value={bId} onChange={e => setBId(e.target.value)}>
+                    <option value="">Select…</option>
+                    {allStudentsGlobal.map(s => <option key={s.id} value={s.id}>{s.name} — {teacherName(s.teacher_id)}</option>)}
+                  </select>
+                </div>
+              </div>
+
+              {a && b && alreadyLinked && (
+                <div style={{ background: "#EEF2FF", border: "1.5px solid #C7D2FE", borderRadius: 10, padding: 12, marginBottom: 14, fontSize: 13, color: "#4F46E5" }}>
+                  🔗 These two students already share the same login — nothing to merge.
+                </div>
+              )}
+
+              {a && b && !alreadyLinked && (
+                <div style={{ marginBottom: 14 }}>
+                  {a.grade !== b.grade && (
+                    <div style={{ background: "#FFFBEB", border: "1.5px solid #FDE68A", borderRadius: 10, padding: 10, marginBottom: 10, fontSize: 12, color: "#92400E" }}>
+                      ⚠️ These students have different grades ({a.grade} vs {b.grade}) — double check this is really the same student before merging.
+                    </div>
+                  )}
+                  <label className="lbl">Which login should the student keep?</label>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 6 }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 8, padding: 10, border: "1.5px solid #E2E8F0", borderRadius: 10, cursor: "pointer", background: primary === "a" ? "#EEF2FF" : "transparent" }}>
+                      <input type="radio" checked={primary === "a"} onChange={() => setPrimary("a")} />
+                      <span style={{ fontSize: 13 }}><strong>{a.name}</strong> ({teacherName(a.teacher_id)}, {a.grade}) — keep this login</span>
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 8, padding: 10, border: "1.5px solid #E2E8F0", borderRadius: 10, cursor: "pointer", background: primary === "b" ? "#EEF2FF" : "transparent" }}>
+                      <input type="radio" checked={primary === "b"} onChange={() => setPrimary("b")} />
+                      <span style={{ fontSize: 13 }}><strong>{b.name}</strong> ({teacherName(b.teacher_id)}, {b.grade}) — keep this login</span>
+                    </label>
+                  </div>
+                  <div style={{ fontSize: 12, color: "#94A3B8", marginTop: 8 }}>
+                    Both students' classes, assignments, and grades stay exactly where they are — only the login credentials get consolidated into one.
+                  </div>
+                </div>
+              )}
+
+              <button className="btn1" onClick={merge} disabled={!a || !b || merging || alreadyLinked} style={{ width: "100%" }}>
+                {merging ? "Merging…" : "Merge These Students"}
+              </button>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ManageStudentsView({ allStudentsGlobal, allTeachers, allLinks, allAccounts, busy, toggleStudentActive, reload }) {
+  const teacherName = tid => allTeachers.find(t => t.id === tid)?.name || "—";
+  // Group student rows sharing the same login (student_account_id) so we can
+  // show clear "merged" messaging — this is what makes a successful merge
+  // visible in the list, instead of the two rows looking like unrelated
+  // duplicates or unclear about which side merged into which.
+  const accountIdFor = studentId => (allLinks || []).find(l => l.student_id === studentId)?.student_account_id || null;
+  const usernameFor = accountId => (allAccounts || []).find(a => a.id === accountId)?.username || null;
+  const siblingsOf = (studentId) => {
+    const acctId = accountIdFor(studentId);
+    if (!acctId) return [];
+    const siblingIds = (allLinks || []).filter(l => l.student_account_id === acctId && l.student_id !== studentId).map(l => l.student_id);
+    return allStudentsGlobal.filter(s => siblingIds.includes(s.id));
+  };
+
+  return (
+    <div>
+      <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 24, fontWeight: 800, color: "#0F172A", marginBottom: 4 }}>Students</div>
+      <div style={{ color: "#64748B", fontSize: 14, marginBottom: 20 }}>{allStudentsGlobal.length} student account{allStudentsGlobal.length !== 1 ? "s" : ""} across all teachers</div>
+      <MergeStudentsPanel allStudentsGlobal={allStudentsGlobal} allTeachers={allTeachers} allLinks={allLinks} reload={reload} />
+      <div className="card" style={{ padding: 0, overflow: "hidden" }}>
+        {allStudentsGlobal.map((s, i) => {
+          const siblings = siblingsOf(s.id);
+          const username = siblings.length > 0 ? usernameFor(accountIdFor(s.id)) : null;
+          return (
+            <div key={s.id} style={{ padding: "16px 20px", borderBottom: i < allStudentsGlobal.length - 1 ? "1px solid #F1F5F9" : "none" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                <div className="av" style={{ background: getAC(s.id) }}>{s.avatar || s.name?.[0] || "?"}</div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 600, fontSize: 14, color: "#0F172A" }}>{s.name}</div>
+                  <div style={{ fontSize: 12, color: "#64748B" }}>{s.grade} · Teacher: {teacherName(s.teacher_id)}</div>
+                </div>
+                <span className="bdg" style={{ background: s.active ? "#D1FAE5" : "#FEE2E2", color: s.active ? "#059669" : "#DC2626" }}>{s.active ? "Active" : "Disabled"}</span>
+                <button className={s.active ? "btnd" : "btng"} style={{ fontSize: 12 }} disabled={busy === s.id} onClick={() => toggleStudentActive(s)}>
+                  {s.active ? "Disable" : "Enable"}
+                </button>
+              </div>
+              {siblings.length > 0 && (
+                <div style={{ marginLeft: 54, marginTop: 8, fontSize: 12, color: "#4F46E5", background: "#EEF2FF", borderRadius: 8, padding: "6px 10px", display: "inline-block" }}>
+                  ✅ Record merged under one login{username ? <> — username: <strong>{username}</strong></> : ""} · also enrolled with: {siblings.map(sib => `${sib.name} (${teacherName(sib.teacher_id)})`).join(", ")}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {allStudentsGlobal.length === 0 && <div style={{ textAlign: "center", padding: 32, color: "#94A3B8" }}>No students yet.</div>}
+      </div>
+    </div>
+  );
+}
+
 function TeacherApp({ initialData, session, onLogout }) {
   const [classes, setClasses] = useState(initialData.classes);
   const [students, setStudents] = useState(initialData.students);
@@ -707,19 +1046,58 @@ function TeacherApp({ initialData, session, onLogout }) {
   const [view, setView] = useState("dashboard");
   const [modal, setModal] = useState(null); const [modalData, setModalData] = useState({});
   const [sidebar, setSidebar] = useState(true);
+  const isAdmin = !!initialData.isAdmin;
+  const [allTeachers, setAllTeachers] = useState(initialData.allTeachers || []);
+  const [allStudentsGlobal, setAllStudentsGlobal] = useState(initialData.allStudentsGlobal || []);
+  const [allLinks, setAllLinks] = useState(initialData.allLinks || []);
+  const [allAccounts, setAllAccounts] = useState(initialData.allAccounts || []);
+  const [adminBusy, setAdminBusy] = useState(null);
   const user = { id: session.user.id, email: session.user.email, name: session.user.user_metadata?.name || session.user.email.split("@")[0] };
-  const reload = async () => { setAppLoading(true); try { const d = await loadTeacherData(user.id); setClasses(d.classes); setStudents(d.students); setAssignments(d.assignments); } catch (e) { console.error(e); } finally { setAppLoading(false); } };
+  const reload = async () => {
+    setAppLoading(true);
+    try {
+      const d = await loadTeacherData(user.id);
+      setClasses(d.classes); setStudents(d.students); setAssignments(d.assignments);
+      if (isAdmin) { const ad = await loadAdminData(); setAllTeachers(ad.teachers); setAllStudentsGlobal(ad.students); setAllLinks(ad.links || []); setAllAccounts(ad.accounts || []); }
+    } catch (e) { console.error(e); } finally { setAppLoading(false); }
+  };
+  const toggleTeacherActive = async (t) => {
+    if (t.id === user.id && t.active) { if (!confirm("This will disable your own account and sign you out. Continue?")) return; }
+    setAdminBusy(t.id);
+    try { await db("teachers", "PATCH", `id=eq.${t.id}`, { active: !t.active }); await reload(); }
+    catch (e) { alert(e.message); } finally { setAdminBusy(null); }
+  };
+  const toggleTeacherRole = async (t) => {
+    const nextRole = t.role === "admin" ? "teacher" : "admin";
+    if (t.id === user.id && t.role === "admin") { if (!confirm("This will remove your own admin access. Continue?")) return; }
+    setAdminBusy(t.id);
+    try { await db("teachers", "PATCH", `id=eq.${t.id}`, { role: nextRole }); await reload(); }
+    catch (e) { alert(e.message); } finally { setAdminBusy(null); }
+  };
+  const toggleStudentActive = async (s) => {
+    setAdminBusy(s.id);
+    try { await db("students", "PATCH", `id=eq.${s.id}`, { active: !s.active }); await reload(); }
+    catch (e) { alert(e.message); } finally { setAdminBusy(null); }
+  };
   const openModal = (type, data = {}) => { setModal(type); setModalData(data); };
   const closeModal = () => { setModal(null); setModalData({}); };
   const ctx = { classes, students, assignments, openModal, reload, userId: user.id };
-  const navItems = [{ id: "dashboard", label: "Dashboard", icon: "⊞" }, { id: "classes", label: "My Classes", icon: "🏫" }, { id: "students", label: "Students", icon: "👨‍🎓" }, { id: "assignments", label: "Assignments", icon: "📋" }, { id: "results", label: "Results", icon: "📊" }, { id: "subjects", label: "Subjects & Grades", icon: "📚" }];
+  const navItems = [
+    { id: "dashboard", label: "Dashboard", icon: "⊞" }, { id: "classes", label: "My Classes", icon: "🏫" },
+    { id: "students", label: "Students", icon: "👨‍🎓" }, { id: "assignments", label: "Assignments", icon: "📋" },
+    { id: "results", label: "Results", icon: "📊" }, { id: "subjects", label: "Subjects & Grades", icon: "📚" },
+    ...(isAdmin ? [
+      { id: "manageTeachers", label: "Manage Teachers", icon: "🛡️" },
+      { id: "manageStudents", label: "Manage Students", icon: "🗂️" }
+    ] : [])
+  ];
   return (
     <div style={{ fontFamily: "'Inter','Outfit',sans-serif", display: "flex", height: "100vh", background: "#F0F2F8", overflow: "hidden" }}>
       <style>{CSS}</style>
       <div style={{ width: sidebar ? 240 : 72, background: "linear-gradient(180deg,#0F172A 0%,#1E1B4B 100%)", display: "flex", flexDirection: "column", padding: "20px 12px", transition: "width 0.25s", flexShrink: 0, overflow: "hidden" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 24, padding: "0 4px" }}>
           <div style={{ width: 36, height: 36, background: "linear-gradient(135deg,#4F46E5,#7C3AED)", borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, fontSize: 18 }}>🎓</div>
-          {sidebar && <div><div style={{ fontFamily: "Outfit,sans-serif", color: "#fff", fontWeight: 800, fontSize: 16 }}>EduHive</div><div style={{ color: "#475569", fontSize: 10 }}>Teacher Portal</div></div>}
+          {sidebar && <div><div style={{ fontFamily: "Outfit,sans-serif", color: "#fff", fontWeight: 800, fontSize: 16 }}>EduHive</div><div style={{ color: "#475569", fontSize: 10 }}>{isAdmin ? "Teacher + Admin Portal" : "Teacher Portal"}</div></div>}
         </div>
         <nav style={{ flex: 1 }}>{navItems.map(n => <div key={n.id} className={`ni${view === n.id ? " on" : ""}`} onClick={() => setView(n.id)} title={n.label}><span style={{ fontSize: 18, flexShrink: 0 }}>{n.icon}</span>{sidebar && <span>{n.label}</span>}</div>)}</nav>
         {sidebar && <div style={{ marginTop: 16, padding: "8px 4px", borderTop: "1px solid #1E293B" }}><div style={{ color: "#475569", fontSize: 11, marginBottom: 4 }}>Signed in as</div><div style={{ color: "#94A3B8", fontSize: 11, marginBottom: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{user.name}</div><button onClick={onLogout} style={{ background: "rgba(239,68,68,0.15)", color: "#FCA5A5", border: "none", padding: "7px 12px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 600, width: "100%", fontFamily: "inherit" }}>Sign Out</button></div>}
@@ -733,6 +1111,8 @@ function TeacherApp({ initialData, session, onLogout }) {
           {view === "assignments" && <AssignmentsView {...ctx} />}
           {view === "results" && <ResultsView {...ctx} />}
           {view === "subjects" && <SubjectsView {...ctx} />}
+          {view === "manageTeachers" && isAdmin && <ManageTeachersView allTeachers={allTeachers} me={user.id} busy={adminBusy} toggleTeacherActive={toggleTeacherActive} toggleTeacherRole={toggleTeacherRole} />}
+          {view === "manageStudents" && isAdmin && <ManageStudentsView allStudentsGlobal={allStudentsGlobal} allTeachers={allTeachers} allLinks={allLinks} allAccounts={allAccounts} busy={adminBusy} toggleStudentActive={toggleStudentActive} reload={reload} />}
         </>}
       </div>
       {modal && <div className="ovl"><div className="modal" onClick={e => e.stopPropagation()}>
@@ -812,6 +1192,10 @@ function StudentInviteModal({ student, reload, close }) {
       const created = text ? JSON.parse(text) : null;
       if (created?.length) {
         setToken(created[0].invite_token);
+        // Link this new account to its student row so it resolves correctly
+        // at login (this is the row that was missing before — see chat).
+        try { await db("student_account_links", "POST", "", { student_account_id: created[0].id, student_id: student.id }); }
+        catch (linkErr) { console.error("Failed to create student_account_link:", linkErr); }
       } else {
         // Conflict — refetch
         const refetch = await db("student_accounts", "GET", `student_id=eq.${student.id}`);
@@ -1012,36 +1396,121 @@ function AddStudentModal({ reload, userId, close }) {
   const [grade, setGrade] = useState(GRADES[4]);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
+  const [match, setMatch] = useState(null); // an existing student_accounts row matching this email, awaiting confirmation
 
   // Auto-generate username from name
   const autoUsername = (n) => n.toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "").substring(0, 20);
 
+  const validate = () => {
+    if (!name.trim()) { setErr("Student name is required."); return false; }
+    if (!username.trim()) { setErr("Username is required — students use this to log in."); return false; }
+    if (!/^[a-z0-9_]+$/.test(username)) { setErr("Username can only contain lowercase letters, numbers and underscores."); return false; }
+    if (!email.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) { setErr("A valid contact email is required — it's how we detect if this student already has an account with another teacher."); return false; }
+    return true;
+  };
+
+  const createNewStudent = async () => {
+    const initials = name.split(" ").map(w => w[0]).join("").toUpperCase().substring(0, 2);
+    await db("students", "POST", "", {
+      teacher_id: userId,
+      name: name.trim(),
+      username: username.trim().toLowerCase(),
+      email: email.trim().toLowerCase(),
+      grade,
+      avatar: initials
+    });
+  };
+
+  // Create a new per-teacher student row, but link it to the EXISTING login
+  // identity instead of creating a duplicate account — the student keeps
+  // using their original username/password and just sees this teacher added
+  // to their teacher-switcher on next login.
+  const linkToExisting = async (existingAccount) => {
+    const initials = name.split(" ").map(w => w[0]).join("").toUpperCase().substring(0, 2);
+    const [newStudent] = await db("students", "POST", "", {
+      teacher_id: userId,
+      name: name.trim(),
+      username: username.trim().toLowerCase(),
+      email: email.trim().toLowerCase(),
+      grade,
+      avatar: initials
+    });
+    await db("student_account_links", "POST", "", {
+      student_account_id: existingAccount.id,
+      student_id: newStudent.id
+    });
+  };
+
   const save = async () => {
     setErr("");
-    if (!name.trim()) { setErr("Student name is required."); return; }
-    if (!username.trim()) { setErr("Username is required — students use this to log in."); return; }
-    if (!/^[a-z0-9_]+$/.test(username)) { setErr("Username can only contain lowercase letters, numbers and underscores."); return; }
+    if (!validate()) return;
     setLoading(true);
     try {
-      const initials = name.split(" ").map(w => w[0]).join("").toUpperCase().substring(0, 2);
-      await db("students", "POST", "", {
-        teacher_id: userId,
-        name: name.trim(),
-        username: username.trim().toLowerCase(),
-        email: email.trim().toLowerCase() || "",
-        grade,
-        avatar: initials
-      });
+      // Check for existing accounts under this contact email — but a shared
+      // parent/family email is common across SIBLINGS, so email alone isn't
+      // proof of "same student." Only flag it as a likely match when the
+      // student's name also matches; a different name under the same email
+      // is almost certainly a sibling, so it proceeds silently as a new,
+      // separate account without interrupting the teacher.
+      const normalize = s => (s || "").trim().toLowerCase().replace(/\s+/g, " ");
+      const sameEmail = await db("student_accounts", "GET", `email=eq.${email.trim().toLowerCase()}`);
+      const nameMatch = (sameEmail || []).find(a => normalize(a.student_name) === normalize(name));
+      if (nameMatch) {
+        setMatch(nameMatch);
+        setLoading(false);
+        return; // wait for teacher to confirm link vs. create separate
+      }
+      // Email matched other account(s) but with a different name — treat as
+      // a sibling, not a duplicate. Create a normal separate account.
+      await createNewStudent();
       await reload();
       close();
-    } catch (e) { setErr(e.message); }
+    } catch (e) { setErr(e.message); setLoading(false); }
+  };
+
+  const confirmLink = async () => {
+    setLoading(true); setErr("");
+    try { await linkToExisting(match); await reload(); close(); }
+    catch (e) { setErr(e.message); }
     finally { setLoading(false); }
   };
+
+  const confirmSeparate = async () => {
+    setLoading(true); setErr("");
+    try { await createNewStudent(); await reload(); close(); }
+    catch (e) { setErr(e.message); }
+    finally { setLoading(false); }
+  };
+
+  if (match) {
+    return (
+      <div>
+        <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 20, fontWeight: 800, color: "#0F172A", marginBottom: 6 }}>Existing Student Found</div>
+        <div style={{ color: "#64748B", fontSize: 13, marginBottom: 20 }}>
+          A student account with this name and contact email already exists. Is this the same student, already enrolled with another teacher?
+        </div>
+        {err && <div className="err" style={{ marginBottom: 12 }}>{err}</div>}
+        <div style={{ background: "#F8FAFF", border: "1.5px solid #E8EEFF", borderRadius: 12, padding: 16, marginBottom: 20 }}>
+          <div style={{ fontWeight: 700, fontSize: 15, color: "#0F172A" }}>{match.student_name || "Unnamed student"}</div>
+          <div style={{ fontSize: 13, color: "#64748B", marginTop: 2 }}>Username: {match.username || "—"}</div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <button className="btn1" onClick={confirmLink} disabled={loading}>
+            {loading ? "Linking…" : "Yes — link to this student's existing login"}
+          </button>
+          <button className="btn2" onClick={confirmSeparate} disabled={loading}>
+            {loading ? "Creating…" : "No — this is a different student, create a new login"}
+          </button>
+          <button onClick={() => setMatch(null)} style={{ background: "none", border: "none", color: "#94A3B8", fontSize: 12, cursor: "pointer", padding: 6 }}>← Back</button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div>
       <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 22, fontWeight: 800, color: "#0F172A", marginBottom: 6 }}>Add New Student</div>
-      <div style={{ color: "#64748B", fontSize: 13, marginBottom: 20 }}>Students log in with their username + password — no email needed.</div>
+      <div style={{ color: "#64748B", fontSize: 13, marginBottom: 20 }}>Students log in with their username + password. Contact email is required to detect if this student already has an account with another teacher — siblings can safely share the same email.</div>
       {err && <div className="err">{err}</div>}
       <div style={{ marginBottom: 16 }}>
         <label className="lbl">Full Name *</label>
@@ -1053,8 +1522,8 @@ function AddStudentModal({ reload, userId, close }) {
         {username && <div style={{ fontSize: 11, color: "#64748B", marginTop: 4 }}>Student logs in at EduHive with: <strong>{username}</strong> + their password</div>}
       </div>
       <div style={{ marginBottom: 16 }}>
-        <label className="lbl">Contact Email <span style={{ color: "#94A3B8", fontWeight: 400, fontSize: 11, textTransform: "none" }}>(optional — for teacher reference only)</span></label>
-        <input className="inp" type="email" placeholder="parent@gmail.com (optional)" value={email} onChange={e => setEmail(e.target.value)} />
+        <label className="lbl">Contact Email * <span style={{ color: "#94A3B8", fontWeight: 400, fontSize: 11, textTransform: "none" }}>(used to detect an existing account)</span></label>
+        <input className="inp" type="email" placeholder="parent@gmail.com" value={email} onChange={e => setEmail(e.target.value)} />
       </div>
       <div style={{ marginBottom: 24 }}>
         <label className="lbl">Grade</label>
@@ -1062,7 +1531,7 @@ function AddStudentModal({ reload, userId, close }) {
       </div>
       <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
         <button className="btn2" onClick={close}>Cancel</button>
-        <button className="btn1" onClick={save} disabled={loading}>{loading ? "Saving…" : "Add Student"}</button>
+        <button className="btn1" onClick={save} disabled={loading}>{loading ? "Checking…" : "Add Student"}</button>
       </div>
     </div>
   );
@@ -2063,7 +2532,7 @@ function AssignmentResultsModal({ assignment: a, students, reload, close }) {
   const studentIds = [...new Set([...subs.map(s => s.student_id), ...retakes.map(r => r.student_id)])];
 
   const QuestionBreakdown = ({ questions, getSelected }) => (
-    <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+    <div className="no-copy" onContextMenu={e => e.preventDefault()} onCopy={e => e.preventDefault()} style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
       {(questions || []).map((q, i) => {
         const selected = getSelected(q);
         const correct = selected?.toLowerCase() === q.correct_answer?.toLowerCase();
@@ -2207,7 +2676,14 @@ function StudentApp({ initialData, session, onLogout }) {
   const [view, setView] = useState("home");
   const [activeAssignment, setActiveAssignment] = useState(null);
   const [loading, setLoading] = useState(false);
-  const reload = async () => { setLoading(true); try { const d = await loadStudentData(session.user.id); setData(d); } catch (e) { console.error(e); } finally { setLoading(false); } };
+  const reload = async () => { setLoading(true); try { const d = await loadStudentData(session.user.id, data.selectedStudentId); setData(d); } catch (e) { console.error(e); } finally { setLoading(false); } };
+  const switchProfile = async (studentId) => {
+    if (studentId === data.selectedStudentId) return;
+    setLoading(true);
+    try { const d = await loadStudentData(session.user.id, studentId); setData(d); setView("home"); }
+    catch (e) { console.error(e); }
+    finally { setLoading(false); }
+  };
   const openQuiz = (assignment) => { setActiveAssignment(assignment); setView("quiz"); };
   const closeQuiz = () => { setView("home"); setActiveAssignment(null); reload(); };
   const [practiceGrade, setPracticeGrade] = useState(data?.student?.grade || "Grade 4");
@@ -2239,7 +2715,24 @@ const [loadingTopics, setLoadingTopics] = useState(false);
     <style>{CSS}</style>
     <div style={{ background: "linear-gradient(135deg,#0F172A,#1E1B4B)", padding: "16px 32px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 12 }}><div style={{ width: 36, height: 36, background: "linear-gradient(135deg,#4F46E5,#7C3AED)", borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>🎓</div><div><div style={{ fontFamily: "Outfit,sans-serif", color: "#fff", fontWeight: 800, fontSize: 16 }}>EduHive</div><div style={{ color: "#475569", fontSize: 11 }}>Student Portal</div></div></div>
-      <div style={{ display: "flex", alignItems: "center", gap: 16 }}><div style={{ color: "#94A3B8", fontSize: 13 }}>👋 {student?.name}</div><button onClick={onLogout} style={{ background: "rgba(239,68,68,0.15)", color: "#FCA5A5", border: "none", padding: "7px 14px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 600, fontFamily: "inherit" }}>Sign Out</button></div>
+      <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+        {data.linkedProfiles && data.linkedProfiles.length > 1 && (
+          <select
+            className="sel"
+            value={data.selectedStudentId}
+            onChange={e => switchProfile(e.target.value)}
+            style={{ background: "rgba(255,255,255,0.1)", color: "#E2E8F0", border: "1px solid rgba(255,255,255,0.15)", fontSize: 12, padding: "6px 10px", width: "auto" }}
+          >
+            {data.linkedProfiles.map(p => (
+              <option key={p.studentId} value={p.studentId} disabled={!p.active} style={{ color: "#0F172A" }}>
+                {p.teacherName}{!p.active ? " (disabled)" : ""}
+              </option>
+            ))}
+          </select>
+        )}
+        <div style={{ color: "#94A3B8", fontSize: 13 }}>👋 {student?.name}</div>
+        <button onClick={onLogout} style={{ background: "rgba(239,68,68,0.15)", color: "#FCA5A5", border: "none", padding: "7px 14px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 600, fontFamily: "inherit" }}>Sign Out</button>
+      </div>
     </div>
     {loading ? <Loader text="Refreshing…" /> : <div style={{ padding: "28px 32px" }}>
       <div style={{ marginBottom: 28 }}><div style={{ fontFamily: "Outfit,sans-serif", fontSize: 26, fontWeight: 800, color: "#0F172A" }}>Welcome back, {student?.name?.split(" ")[0]}! 👋</div><div style={{ color: "#64748B", fontSize: 14, marginTop: 4 }}>{student?.grade} · {classes.length} classes enrolled</div></div>
@@ -2513,7 +3006,12 @@ function LibraryBrowser({ onAdd, close }) {
 
       {/* Question list */}
       {!loading && questions.length > 0 && (
-        <div style={{ maxHeight: 380, overflowY: "auto", border: "1.5px solid #E2E8F0", borderRadius: 12, marginBottom: 16 }}>
+        <div
+          className="no-copy"
+          onContextMenu={e => e.preventDefault()}
+          onCopy={e => e.preventDefault()}
+          style={{ maxHeight: 380, overflowY: "auto", border: "1.5px solid #E2E8F0", borderRadius: 12, marginBottom: 16 }}
+        >
           {questions.map((q, i) => {
             const sel = selected.has(q.id);
             const tc = typeColor(q.question_type);
@@ -2795,6 +3293,7 @@ function TopicPracticeModal({ grade, subject, topic, student, onClose }) {
         )}
 
         {/* Questions */}
+        <div className="no-copy" onContextMenu={e => e.preventDefault()} onCopy={e => e.preventDefault()}>
         {(submitted ? result.graded : questions).map((q, i) => {
           const selected = submitted ? q.selected : answers[q.id];
           const opts = q.question_type === "true_false" ? ["true", "false"] : (q.options || []);
@@ -2845,6 +3344,7 @@ function TopicPracticeModal({ grade, subject, topic, student, onClose }) {
             </div>
           );
         })}
+        </div>
 
         {/* Submit / Back */}
         {!submitted ? (
@@ -3333,6 +3833,7 @@ function QuizInterface({ assignment, student, session, onClose }) {
         )}
 
         {/* Questions */}
+        <div className="no-copy" onContextMenu={e => e.preventDefault()} onCopy={e => e.preventDefault()}>
         {questions.map((q, i) => {
           const selected = answers[q.id];
           const isCorrect = selected?.toLowerCase() === q.correct_answer?.toLowerCase();
@@ -3384,6 +3885,7 @@ function QuizInterface({ assignment, student, session, onClose }) {
             </div>
           );
         })}
+        </div>
 
         {/* Submit / Back buttons */}
         {!submitted && needsUpload && renderUploadAndSubmit()}
