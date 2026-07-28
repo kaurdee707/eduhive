@@ -1870,10 +1870,13 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
   const save = async () => {
     if (!title.trim() || !classId) { setErr("Title and class are required."); return; }
     setLoading(true); setErr(""); setUploadProgress("");
+
+    // Step 1: create the assignment row. If THIS fails, nothing was created —
+    // safe to show the error and let the teacher fix and retry.
+    let newA;
     try {
-      // 1. Create assignment record
       setUploadProgress("Creating assignment…");
-      const [newA] = await db("assignments", "POST", "", {
+      [newA] = await db("assignments", "POST", "", {
         teacher_id: userId, class_id: classId, subject,
         title: title.trim(), description: desc,
         topic: topic.trim() || null,
@@ -1883,45 +1886,63 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
         file_name: fileName || null,
         status: "active"
       });
+    } catch (e) {
+      setErr(e.message);
+      setLoading(false); setUploadProgress("");
+      return;
+    }
 
+    // From here on, the assignment already exists in the database. Retrying
+    // the whole Save flow would create a duplicate — so every step below is
+    // independently non-fatal: we collect warnings instead of throwing, and
+    // ALWAYS reload + close at the end, regardless of what partially failed.
+    const warnings = [];
+    try {
       // 2. Upload file if one was selected
-      let fileUrl = null;
       if (file && newA.id) {
         setUploadProgress("Uploading file… please wait");
         try {
-          fileUrl = await uploadFile(file, userId, newA.id);
-          // Update assignment with file URL
+          const fileUrl = await uploadFile(file, userId, newA.id);
           await db("assignments", "PATCH", `id=eq.${newA.id}`, { file_url: fileUrl });
         } catch (uploadErr) {
-          // Don't fail the whole assignment if upload fails — just warn
           console.error("File upload failed:", uploadErr);
-          setErr("Assignment saved but file upload failed: " + uploadErr.message);
+          warnings.push("File upload failed — you can attach it later via Edit Assignment.");
         }
       }
 
       // 3. Assign to students
       setUploadProgress("Assigning to students…");
-      const targets = assignedTo.length ? assignedTo : classStudents.map(s => s.id);
-      await Promise.all(targets.map(sid =>
-        db("assignment_students", "POST", "", { assignment_id: newA.id, student_id: sid })
-      ));
+      try {
+        const targets = assignedTo.length ? assignedTo : classStudents.map(s => s.id);
+        await Promise.all(targets.map(sid =>
+          db("assignment_students", "POST", "", { assignment_id: newA.id, student_id: sid })
+        ));
+      } catch (e) {
+        console.error("Assigning students failed:", e);
+        warnings.push("Some students may not have been assigned — check Edit Assignment.");
+      }
 
       // 4. Save questions
       const validQuestions = questions.filter(q => q.text.trim() && q.correct);
       let insertedQuestions = [];
       if (validQuestions.length > 0) {
         setUploadProgress("Saving questions…");
-        insertedQuestions = await Promise.all(validQuestions.map((q, i) =>
-          db("questions", "POST", "", {
-            assignment_id: newA.id, question_text: q.text,
-            question_type: q.type,
-            options: q.type === "multiple_choice" ? q.options : null,
-            correct_answer: q.correct,
-            explanation: q.explanation || null,
-            points: 1, order_index: i,
-            synced_to_library: !!q.fromLibrary
-          }).then(rows => ({ row: rows[0], src: q }))
-        ));
+        try {
+          insertedQuestions = await Promise.all(validQuestions.map((q, i) =>
+            db("questions", "POST", "", {
+              assignment_id: newA.id, question_text: q.text,
+              question_type: q.type,
+              options: q.type === "multiple_choice" ? q.options : null,
+              correct_answer: q.correct,
+              explanation: q.explanation || null,
+              points: 1, order_index: i,
+              synced_to_library: !!q.fromLibrary
+            }).then(rows => ({ row: rows[0], src: q }))
+          ));
+        } catch (e) {
+          console.error("Saving questions failed:", e);
+          warnings.push("Some questions may not have saved — check Edit Assignment.");
+        }
       }
 
       // 5. Auto-add teacher-authored (non-library) questions to the shared question library,
@@ -1946,16 +1967,17 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
               db("questions", "PATCH", `id=eq.${iq.row.id}`, { synced_to_library: true })
             ));
           } catch (syncErr) {
-            // Non-fatal — the assignment itself is already saved successfully
+            // Non-fatal and low-stakes enough not to warn about — the assignment itself is fine
             console.error("Library sync failed:", syncErr);
           }
         }
       }
-
+    } finally {
       await reload();
+      setLoading(false); setUploadProgress("");
       close();
-    } catch (e) { setErr(e.message); }
-    finally { setLoading(false); setUploadProgress(""); }
+      if (warnings.length) alert("Assignment created, but a few things need a look:\n\n" + warnings.join("\n"));
+    }
   };
 
   return (
