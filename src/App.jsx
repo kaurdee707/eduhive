@@ -1825,6 +1825,8 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
   const [loadingTopics, setLoadingTopics] = useState(false);
   const [videoId, setVideoId] = useState(null);
   const [requiresUpload, setRequiresUpload] = useState(false);
+  const [startDate, setStartDate] = useState("");
+  const [externalLink, setExternalLink] = useState("");
   const [classId, setClassId] = useState(data.classId || classes[0]?.id || "");
   const [dueDate, setDueDate] = useState("");
   const [desc, setDesc] = useState("");
@@ -1882,6 +1884,8 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
         topic: topic.trim() || null,
         topic_video_id: videoId || null,
         requires_upload: requiresUpload,
+        start_date: startDate || null,
+        external_link: externalLink.trim() || null,
         due_date: dueDate || null,
         file_name: fileName || null,
         status: "active"
@@ -2029,9 +2033,20 @@ function AddAssignmentModal({ classes, students, reload, userId, data, close }) 
           </select>
         </div>
         <TopicVideoPicker grade={selClass?.grade} subject={subject} topic={topic.trim()} videoId={videoId} setVideoId={setVideoId} />
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
+          <div>
+            <label className="lbl">Start Date <span style={{ color: "#94A3B8", fontWeight: 400, fontSize: 11, textTransform: "none" }}>(optional)</span></label>
+            <input className="inp" type="date" value={startDate} onChange={e => setStartDate(e.target.value)} />
+          </div>
+          <div>
+            <label className="lbl">Due Date</label>
+            <input className="inp" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} />
+          </div>
+        </div>
         <div style={{ marginBottom: 16 }}>
-          <label className="lbl">Due Date</label>
-          <input className="inp" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} />
+          <label className="lbl">External Game/Practice Link <span style={{ color: "#94A3B8", fontWeight: 400, fontSize: 11, textTransform: "none" }}>(optional — e.g. Blooket, Kahoot)</span></label>
+          <input className="inp" type="url" placeholder="https://blooket.com/play/..." value={externalLink} onChange={e => setExternalLink(e.target.value)} />
+          <div style={{ fontSize: 11, color: "#94A3B8", marginTop: 4 }}>Shown to students when they open this assignment. You'll grade their result manually once you check the game platform's score — pair this with "Requires student upload & teacher grading" below.</div>
         </div>
         <label style={{ display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 16, padding: 12, border: "1.5px solid #E2E8F0", borderRadius: 10, cursor: "pointer", background: requiresUpload ? "#FFFBEB" : "transparent" }}>
           <input type="checkbox" checked={requiresUpload} onChange={e => setRequiresUpload(e.target.checked)} style={{ accentColor: "#D97706", marginTop: 2 }} />
@@ -2132,6 +2147,8 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
   const [topic, setTopic] = useState(a.topic || "");
   const [videoId, setVideoId] = useState(a.topic_video_id || null);
   const [requiresUpload, setRequiresUpload] = useState(!!a.requires_upload);
+  const [startDate, setStartDate] = useState(a.start_date || "");
+  const [externalLink, setExternalLink] = useState(a.external_link || "");
   const [dueDate, setDueDate] = useState(a.due_date || "");
   const [desc, setDesc] = useState(a.description || "");
   const [file, setFile] = useState(null);              // newly-selected replacement file
@@ -2207,6 +2224,8 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
         topic: topic.trim() || null,
         topic_video_id: videoId || null,
         requires_upload: requiresUpload,
+        start_date: startDate || null,
+        external_link: externalLink.trim() || null,
         due_date: dueDate || null,
         description: desc,
         file_name: fileName || null,
@@ -2325,12 +2344,16 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
           <label className="lbl">Title</label>
           <input className="inp" value={title} onChange={e => setTitle(e.target.value)} />
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 16 }}>
           <div>
             <label className="lbl">Subject</label>
             <select className="sel" value={subject} onChange={e => setSubject(e.target.value)}>
               {SUBJECTS.map(s => <option key={s}>{s}</option>)}
             </select>
+          </div>
+          <div>
+            <label className="lbl">Start Date <span style={{ color: "#94A3B8", fontWeight: 400, fontSize: 10, textTransform: "none" }}>(optional)</span></label>
+            <input className="inp" type="date" value={startDate} onChange={e => setStartDate(e.target.value)} />
           </div>
           <div>
             <label className="lbl">Due Date</label>
@@ -2345,6 +2368,10 @@ function EditAssignmentModal({ assignments, classes, students, reload, userId, d
           </select>
         </div>
         <TopicVideoPicker grade={selClass?.grade} subject={subject} topic={topic.trim()} videoId={videoId} setVideoId={setVideoId} />
+        <div style={{ marginBottom: 16 }}>
+          <label className="lbl">External Game/Practice Link <span style={{ color: "#94A3B8", fontWeight: 400, fontSize: 11, textTransform: "none" }}>(optional — e.g. Blooket, Kahoot)</span></label>
+          <input className="inp" type="url" placeholder="https://blooket.com/play/..." value={externalLink} onChange={e => setExternalLink(e.target.value)} />
+        </div>
         <label style={{ display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 16, padding: 12, border: "1.5px solid #E2E8F0", borderRadius: 10, cursor: "pointer", background: requiresUpload ? "#FFFBEB" : "transparent" }}>
           <input type="checkbox" checked={requiresUpload} onChange={e => setRequiresUpload(e.target.checked)} style={{ accentColor: "#D97706", marginTop: 2 }} />
           <div>
@@ -2775,12 +2802,16 @@ const [loadingTopics, setLoadingTopics] = useState(false);
   const status = rs ? rs.status : (sub?.status || "not_started");
   const d = Math.ceil((new Date(a.due_date) - new Date()) / 86400000);
   const hasQ = a.questions && a.questions.length > 0;
+  // Locked until start_date, but only if the student hasn't already begun —
+  // once in_progress/submitted/pending_review, a later start_date edit shouldn't lock them out
+  const notYetOpen = !!a.start_date && status === "not_started" && new Date(a.start_date + "T00:00:00") > new Date();
 
   // FIX 3: Clean button logic
   // "View Results" only after submitting a quiz
   // "View Assignment" for file/description-only assignments
   // "Start"/"Resume" for quizzes
   const btnConfig = (() => {
+    if (notYetOpen) return { label: `Starts ${new Date(a.start_date + "T00:00:00").toLocaleDateString()}`, color: "#94A3B8", bg: "#F1F5F9" };
     if (status === "submitted") {
       return hasQ
         ? { label: "View Results →", color: "#059669", bg: "#D1FAE5" }
@@ -2797,6 +2828,7 @@ const [loadingTopics, setLoadingTopics] = useState(false);
   })();
 
   const statusBadge = (() => {
+    if (notYetOpen) return { text: "🔒 Not started yet", color: "#94A3B8" };
     if (status === "submitted") return { text: "Submitted ✓", color: "#059669" };
     if (status === "pending_review") return { text: "Under Review ⏳", color: "#D97706" };
     if (status === "in_progress") return { text: "In Progress", color: "#D97706" };
@@ -2806,13 +2838,14 @@ const [loadingTopics, setLoadingTopics] = useState(false);
   return (
     <div
       key={a.id}
-      onClick={() => openQuiz(a)}
+      onClick={() => !notYetOpen && openQuiz(a)}
       style={{
         display: "flex", alignItems: "center", gap: 16,
         padding: "16px 12px", borderBottom: "1px solid #F1F5F9",
-        cursor: "pointer", borderRadius: 10, transition: "background 0.15s"
+        cursor: notYetOpen ? "not-allowed" : "pointer", borderRadius: 10, transition: "background 0.15s",
+        opacity: notYetOpen ? 0.7 : 1
       }}
-      onMouseEnter={e => e.currentTarget.style.background = "#F8FAFF"}
+      onMouseEnter={e => !notYetOpen && (e.currentTarget.style.background = "#F8FAFF")}
       onMouseLeave={e => e.currentTarget.style.background = "transparent"}
     >
       {/* Icon */}
@@ -3706,6 +3739,26 @@ function QuizInterface({ assignment, student, session, onClose }) {
     </div>
   );
 
+  // Safety net (the dashboard card already prevents opening this, but guard
+  // here too in case of direct navigation) — locked until start_date, unless
+  // the student already has some progress on it (don't retroactively lock them out)
+  const notYetOpen = !!assignment.start_date
+    && !alreadySubmitted && !retakeMode && Object.keys(answers).length === 0
+    && new Date(assignment.start_date + "T00:00:00") > new Date();
+  if (notYetOpen) return (
+    <div style={{ fontFamily: "'Inter','Outfit',sans-serif", minHeight: "100vh", background: "#F0F2F8" }}>
+      <style>{CSS}</style>{header}
+      <div style={{ maxWidth: 480, margin: "80px auto", textAlign: "center", padding: "0 20px" }}>
+        <div style={{ fontSize: 48, marginBottom: 12 }}>🔒</div>
+        <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 20, fontWeight: 800, color: "#0F172A", marginBottom: 8 }}>Not open yet</div>
+        <div style={{ color: "#64748B", fontSize: 14, marginBottom: 20 }}>
+          This assignment opens on {new Date(assignment.start_date + "T00:00:00").toLocaleDateString()}. Check back then!
+        </div>
+        <button className="btn2" onClick={onClose}>← Back to Assignments</button>
+      </div>
+    </div>
+  );
+
   // FIX 2: No questions → show assignment details instead of empty quiz
   if (questions.length === 0) {
     return (
@@ -3774,6 +3827,30 @@ function QuizInterface({ assignment, student, session, onClose }) {
     </div>
   </div>
 ) : null}
+
+            {assignment.external_link && (
+              <a
+                href={assignment.external_link}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{
+                  display: "flex", alignItems: "center", gap: 12,
+                  padding: "14px 18px", background: "#F0FDF4",
+                  borderRadius: 12, marginBottom: 16,
+                  textDecoration: "none", border: "2px solid #BBF7D0",
+                  transition: "all 0.18s"
+                }}
+                onMouseEnter={e => e.currentTarget.style.background = "#DCFCE7"}
+                onMouseLeave={e => e.currentTarget.style.background = "#F0FDF4"}
+              >
+                <span style={{ fontSize: 26 }}>🎮</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ color: "#059669", fontWeight: 700, fontSize: 14 }}>Play / Complete Activity</div>
+                  <div style={{ color: "#34D399", fontSize: 12, marginTop: 2 }}>Opens in a new tab — your teacher will grade this once you're done</div>
+                </div>
+                <span style={{ fontSize: 18 }}>↗</span>
+              </a>
+            )}
 
             {!assignment.description && !assignment.file_name && !video && (
               <div style={{ color: "#94A3B8", textAlign: "center", padding: "20px 0" }}>No additional details for this assignment.</div>
@@ -3851,6 +3928,30 @@ function QuizInterface({ assignment, student, session, onClose }) {
               <div style={{ color: "#818CF8", fontSize: 12, marginTop: 2 }}>Click to open / download</div>
             </div>
             <span style={{ fontSize: 20 }}>⬇️</span>
+          </a>
+        )}
+
+        {!submitted && assignment.external_link && (
+          <a
+            href={assignment.external_link}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              display: "flex", alignItems: "center", gap: 12,
+              padding: "14px 18px", background: "#F0FDF4",
+              borderRadius: 12, marginBottom: 24,
+              textDecoration: "none", border: "2px solid #BBF7D0",
+              transition: "all 0.18s"
+            }}
+            onMouseEnter={e => e.currentTarget.style.background = "#DCFCE7"}
+            onMouseLeave={e => e.currentTarget.style.background = "#F0FDF4"}
+          >
+            <span style={{ fontSize: 26 }}>🎮</span>
+            <div style={{ flex: 1 }}>
+              <div style={{ color: "#059669", fontWeight: 700, fontSize: 14 }}>Play / Complete Activity</div>
+              <div style={{ color: "#34D399", fontSize: 12, marginTop: 2 }}>Opens in a new tab — your teacher will grade this once you're done</div>
+            </div>
+            <span style={{ fontSize: 18 }}>↗</span>
           </a>
         )}
 
