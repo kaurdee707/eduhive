@@ -5,10 +5,31 @@ import { useState, useEffect, useRef } from "react";
 // import katex from "katex";
 // import "katex/dist/katex.min.css";
 
-// ── Supabase ──────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+// BRAND & DEPLOYMENT CONFIG — edit ONLY this block to rebrand or repoint
+// this app to a different customer/Supabase project. Nothing else in this
+// file should need to change.
+// ══════════════════════════════════════════════════════════════════════════
+const BRAND = {
+  name: "EduHive",
+  logoEmoji: "🎓",
+  primaryColor: "#4F46E5",   // indigo — used for the logo gradient + core UI accents
+  secondaryColor: "#7C3AED", // purple — logo gradient end color
+};
+
+// Each standalone deployment needs its OWN Supabase project — never point two
+// different customers' deployments at the same project/keys.
 const SB_URL = "https://cvvyumuzkuqtmtamnjoq.supabase.co";
 const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImN2dnl1bXV6a3VxdG10YW1uam9xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQyNDExNDIsImV4cCI6MjA5OTgxNzE0Mn0.u_XKfm-GfplolAHTFqpOxP2ED5iUNZQYGlgsOKw6UXo";
 let TOKEN = SB_KEY;
+
+// Small helper so the CSS template below can derive translucent brand-color
+// variants (e.g. nav highlight) from BRAND.primaryColor instead of a second hardcoded value.
+function hexToRgba(hex, alpha) {
+  const h = hex.replace("#", "");
+  const r = parseInt(h.substring(0, 2), 16), g = parseInt(h.substring(2, 4), 16), b = parseInt(h.substring(4, 6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
 
 async function db(table, method = "GET", filter = "", body = null) {
   const url = `${SB_URL}/rest/v1/${table}${filter ? "?" + filter : ""}`;
@@ -309,6 +330,77 @@ async function loadAdminData() {
   return { teachers, students, links, accounts };
 }
 
+// ── Parent Portal data loading ──────────────────────────────────────────────
+// Resolve every child this parent login is linked to.
+async function getLinkedParentChildren(authUserId) {
+  const accounts = await db("parent_accounts", "GET", `auth_user_id=eq.${authUserId}&select=*`);
+  if (!accounts?.length) throw new Error("Parent account not found");
+  const acct = accounts[0];
+
+  const links = await db("parent_student_links", "GET", `parent_account_id=eq.${acct.id}`);
+  const studentIds = (links || []).map(l => l.student_id);
+  if (studentIds.length === 0) throw new Error("No linked children found on this account yet.");
+
+  const studentRows = await db("students", "GET", `id=in.(${studentIds.join(",")})`);
+  const teacherIds = [...new Set(studentRows.map(s => s.teacher_id))].join(",");
+  const teacherRows = teacherIds ? await db("teachers", "GET", `id=in.(${teacherIds})&select=id,name`) : [];
+
+  return studentRows.map(s => ({
+    studentId: s.id,
+    name: s.name,
+    grade: s.grade,
+    avatar: s.avatar,
+    teacherId: s.teacher_id,
+    teacherName: teacherRows.find(t => t.id === s.teacher_id)?.name || "Unknown Teacher"
+  }));
+}
+
+// Full dashboard for ONE child — includes question-level detail (questions +
+// student_answers + retake snapshots) since the parent view shows the same
+// depth of breakdown as the teacher's Results view.
+async function loadParentChildDashboard(sid) {
+  const studentRows = await db("students", "GET", `id=eq.${sid}`);
+  const student = studentRows?.[0] || { id: sid, name: "Student" };
+
+  const [cs, as2] = await Promise.all([
+    db("class_students", "GET", `student_id=eq.${sid}`),
+    db("assignment_students", "GET", `student_id=eq.${sid}`)
+  ]);
+
+  const classIds = cs.map(x => x.class_id).join(",");
+  const assignmentIds = as2.map(x => x.assignment_id).join(",");
+
+  const [classes, assignments, submissions, studentAnswers, questions, retakeSessions] = await Promise.all([
+    classIds ? db("classes", "GET", `id=in.(${classIds})`) : Promise.resolve([]),
+    assignmentIds ? db("assignments", "GET", `id=in.(${assignmentIds})&order=created_at.desc`) : Promise.resolve([]),
+    assignmentIds ? db("submissions", "GET", `student_id=eq.${sid}`) : Promise.resolve([]),
+    assignmentIds ? db("student_answers", "GET", `student_id=eq.${sid}`) : Promise.resolve([]),
+    assignmentIds ? db("questions", "GET", `assignment_id=in.(${assignmentIds})&order=order_index.asc`) : Promise.resolve([]),
+    assignmentIds ? db("retake_sessions", "GET", `student_id=eq.${sid}&order=attempt_number.asc`) : Promise.resolve([])
+  ]);
+
+  return {
+    student: { ...student, studentId: sid },
+    classes,
+    assignments: assignments.map(a => ({
+      ...a,
+      class: classes.find(c => c.id === a.class_id) || null,
+      submission: submissions.find(s => s.assignment_id === a.id) || null,
+      questions: questions.filter(q => q.assignment_id === a.id),
+      studentAnswers: studentAnswers.filter(sa => sa.assignment_id === a.id),
+      retakeSessions: retakeSessions.filter(rs => rs.assignment_id === a.id)
+    }))
+  };
+}
+
+async function loadParentData(authUserId, preferredStudentId = null) {
+  const children = await getLinkedParentChildren(authUserId);
+  const pick = (preferredStudentId && children.find(c => c.studentId === preferredStudentId)) || children[0];
+  if (!pick) throw new Error("No linked children found.");
+  const dash = await loadParentChildDashboard(pick.studentId);
+  return { ...dash, children, selectedStudentId: pick.studentId };
+}
+
 async function loadTeacherData(uid) {
   const [classes, students, assignments] = await Promise.all([
     db("classes", "GET", `teacher_id=eq.${uid}&order=created_at.asc`),
@@ -450,15 +542,15 @@ const CSS = `
 .no-copy{user-select:none;-webkit-user-select:none;-moz-user-select:none;}
 .no-copy img{-webkit-user-drag:none;user-drag:none;pointer-events:none;}
 .ni{display:flex;align-items:center;gap:10px;padding:10px 16px;border-radius:10px;cursor:pointer;transition:all 0.18s;color:#94A3B8;font-size:14px;font-weight:500}
-.ni:hover{background:rgba(255,255,255,0.08);color:#E2E8F0} .ni.on{background:rgba(79,70,229,0.3);color:#fff;font-weight:600}
+.ni:hover{background:rgba(255,255,255,0.08);color:#E2E8F0} .ni.on{background:${hexToRgba(BRAND.primaryColor, 0.3)};color:#fff;font-weight:600}
 .card{background:#fff;border-radius:16px;padding:24px;box-shadow:0 1px 4px rgba(0,0,0,0.06)}
-.btn1{background:#4F46E5;color:#fff;border:none;padding:10px 20px;border-radius:10px;cursor:pointer;font-weight:600;font-size:14px;transition:all 0.18s;font-family:inherit}
+.btn1{background:${BRAND.primaryColor};color:#fff;border:none;padding:10px 20px;border-radius:10px;cursor:pointer;font-weight:600;font-size:14px;transition:all 0.18s;font-family:inherit}
 .btn1:hover{background:#4338CA;transform:translateY(-1px)} .btn1:disabled{background:#A5B4FC;cursor:wait;transform:none}
 .btn2{background:#F1F5F9;color:#475569;border:none;padding:10px 20px;border-radius:10px;cursor:pointer;font-weight:500;font-size:14px;font-family:inherit} .btn2:hover{background:#E2E8F0}
 .btnd{background:#FEE2E2;color:#DC2626;border:none;padding:7px 14px;border-radius:8px;cursor:pointer;font-weight:500;font-size:13px;font-family:inherit}
 .btng{background:#D1FAE5;color:#065F46;border:none;padding:7px 14px;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px;font-family:inherit}
 .btno{background:#FEF3C7;color:#92400E;border:none;padding:7px 14px;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px;font-family:inherit}
-.inp{width:100%;padding:10px 14px;border:1.5px solid #E2E8F0;border-radius:10px;font-size:14px;outline:none;transition:border 0.15s;font-family:inherit} .inp:focus{border-color:#4F46E5}
+.inp{width:100%;padding:10px 14px;border:1.5px solid #E2E8F0;border-radius:10px;font-size:14px;outline:none;transition:border 0.15s;font-family:inherit} .inp:focus{border-color:${BRAND.primaryColor}}
 .sel{width:100%;padding:10px 14px;border:1.5px solid #E2E8F0;border-radius:10px;font-size:14px;outline:none;background:#fff;font-family:inherit}
 .lbl{font-size:12px;font-weight:600;color:#64748B;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px;display:block}
 .bdg{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600}
@@ -471,13 +563,13 @@ const CSS = `
 .ai{padding:16px;border-radius:12px;background:#F8FAFF;border:1.5px solid #E8EEFF;margin-bottom:10px;transition:all 0.15s}
 .chip{display:inline-flex;align-items:center;gap:4px;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:500}
 .ckl{display:flex;align-items:center;gap:8px;padding:8px;border-radius:8px;cursor:pointer} .ckl:hover{background:#F8FAFF}
-.tab{padding:8px 16px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:500;color:#64748B;transition:all 0.15s;border:none;background:none;font-family:inherit} .tab.on{background:#4F46E5;color:#fff}
+.tab{padding:8px 16px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:500;color:#64748B;transition:all 0.15s;border:none;background:none;font-family:inherit} .tab.on{background:${BRAND.primaryColor};color:#fff}
 .err{background:#FEE2E2;color:#DC2626;padding:10px 14px;border-radius:10px;font-size:13px;margin-bottom:12px}
 .qcard{background:#F8FAFF;border:2px solid #E2E8F0;border-radius:14px;padding:20px;margin-bottom:12px;transition:border 0.15s}
-.qcard.answered{border-color:#4F46E5;background:#EEF2FF}
+.qcard.answered{border-color:${BRAND.primaryColor};background:#EEF2FF}
 .opt{display:flex;align-items:center;gap:12px;padding:12px 16px;border-radius:10px;border:2px solid #E2E8F0;cursor:pointer;margin-bottom:8px;transition:all 0.15s;background:#fff}
 .opt:hover{border-color:#818CF8;background:#F5F3FF}
-.opt.selected{border-color:#4F46E5;background:#EEF2FF}
+.opt.selected{border-color:${BRAND.primaryColor};background:#EEF2FF}
 .opt.correct{border-color:#10B981;background:#D1FAE5}
 .opt.wrong{border-color:#EF4444;background:#FEE2E2}
 .explanation-box{background:#FFFBEB;border:1.5px solid #FCD34D;border-radius:10px;padding:12px 16px;margin-top:10px;font-size:13px;color:#92400E;line-height:1.5}
@@ -516,6 +608,7 @@ function Loader({ text = "Loading…" }) {
 // ── FIX 6: Invite Setup Screen (name now from student_name field) ─────────────
 function InviteSetupScreen({ token, onLogin }) {
   const [studentInfo, setStudentInfo] = useState(null);
+  const [accountType, setAccountType] = useState("student"); // "student" | "parent"
   const [pass, setPass] = useState(""); const [pass2, setPass2] = useState("");
   const [loading, setLoading] = useState(true); const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -524,9 +617,16 @@ function InviteSetupScreen({ token, onLogin }) {
     (async () => {
       try {
         const rows = await db("student_accounts", "GET", `invite_token=eq.${token}&select=id,email,auth_email,username,student_name,invite_accepted,student_id`);
-        if (!rows?.length) setError("Invalid or expired invite link. Ask your teacher for a new one.");
-        else if (rows[0].invite_accepted) setError("This invite has already been used. Go back and log in with your username and password.");
-        else setStudentInfo(rows[0]);
+        if (rows?.length) {
+          if (rows[0].invite_accepted) setError("This invite has already been used. Go back and log in with your username and password.");
+          else { setAccountType("student"); setStudentInfo(rows[0]); }
+        } else {
+          // Not a student invite — check if it's a parent invite instead
+          const parentRows = await db("parent_accounts", "GET", `invite_token=eq.${token}&select=id,email,parent_name,invite_accepted`);
+          if (!parentRows?.length) setError("Invalid or expired invite link. Ask your teacher for a new one.");
+          else if (parentRows[0].invite_accepted) setError("This invite has already been used. Go back and log in with your email and password.");
+          else { setAccountType("parent"); setStudentInfo(parentRows[0]); }
+        }
       } catch (e) { setError(e.message); }
       finally { setLoading(false); }
     })();
@@ -537,6 +637,33 @@ function InviteSetupScreen({ token, onLogin }) {
     if (pass !== pass2) { setError("Passwords don't match."); return; }
     setSaving(true); setError("");
     try {
+      if (accountType === "parent") {
+        const signupEmail = studentInfo.email;
+        if (!signupEmail) throw new Error("No email found on this invite. Ask the teacher to resend it.");
+        const res = await sbSignUp(signupEmail, pass, studentInfo.parent_name || "Parent");
+        if (!res._ok) {
+          if (res._status === 400 && (res.msg || "").toLowerCase().includes("already")) {
+            const signIn = await sbSignIn(signupEmail, pass);
+            if (!signIn._ok) throw new Error("Account already exists. Try logging in directly.");
+            TOKEN = signIn.access_token;
+            const data = await loadParentData(signIn.user.id);
+            onLogin({ type: "parent", session: signIn, data });
+            window.history.replaceState({}, "", window.location.pathname);
+            return;
+          }
+          throw new Error(getAuthError(res));
+        }
+        if (!res.access_token) {
+          setError("Please check your email to confirm your account, then log in.");
+          return;
+        }
+        TOKEN = res.access_token;
+        const data = await loadParentData(res.user.id);
+        onLogin({ type: "parent", session: res, data });
+        window.history.replaceState({}, "", window.location.pathname);
+        return;
+      }
+
       const signupEmail = studentInfo.auth_email || studentInfo.email;
       if (!signupEmail) throw new Error("No login email found. Ask your teacher to resend the invite link.");
 
@@ -581,13 +708,14 @@ function InviteSetupScreen({ token, onLogin }) {
       <style>{CSS}</style>
       <div style={{ background: "#fff", borderRadius: 24, padding: 40, width: 440, maxWidth: "95vw", boxShadow: "0 24px 80px rgba(0,0,0,0.4)" }}>
         <div style={{ textAlign: "center", marginBottom: 24 }}>
-          <div style={{ fontSize: 48, marginBottom: 8 }}>🎓</div>
-          <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 24, fontWeight: 800, color: "#0F172A" }}>Welcome to EduHive!</div>
-          {studentInfo && <div style={{ color: "#64748B", fontSize: 15, marginTop: 6 }}>Hi <strong style={{ color: "#4F46E5" }}>{studentInfo.student_name || "Student"}</strong>! Set a password to get started.</div>}
+          <div style={{ fontSize: 48, marginBottom: 8 }}>{BRAND.logoEmoji}</div>
+          <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 24, fontWeight: 800, color: "#0F172A" }}>Welcome to {BRAND.name}!</div>
+          {studentInfo && accountType === "student" && <div style={{ color: "#64748B", fontSize: 15, marginTop: 6 }}>Hi <strong style={{ color: "#4F46E5" }}>{studentInfo.student_name || "Student"}</strong>! Set a password to get started.</div>}
+          {studentInfo && accountType === "parent" && <div style={{ color: "#64748B", fontSize: 15, marginTop: 6 }}>Hi{studentInfo.parent_name ? <> <strong style={{ color: "#A21CAF" }}>{studentInfo.parent_name}</strong></> : ""}! Set a password to access your child's progress.</div>}
           {error && !studentInfo && <div style={{ color: "#DC2626", marginTop: 12, fontSize: 14, background: "#FEE2E2", padding: "10px 14px", borderRadius: 10 }}>{error}</div>}
         </div>
 
-        {studentInfo && <>
+        {studentInfo && accountType === "student" && <>
           {/* Show username prominently */}
           <div style={{ background: "linear-gradient(135deg,#EEF2FF,#E0E7FF)", borderRadius: 12, padding: "14px 18px", marginBottom: 20, border: "2px solid #C7D2FE" }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: "#4338CA", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>🔑 Your Login Username</div>
@@ -599,6 +727,21 @@ function InviteSetupScreen({ token, onLogin }) {
           <div style={{ marginBottom: 14 }}><label className="lbl">Set Your Password</label><input className="inp" type="password" placeholder="Minimum 6 characters" value={pass} onChange={e => setPass(e.target.value)} /></div>
           <div style={{ marginBottom: 24 }}><label className="lbl">Confirm Password</label><input className="inp" type="password" placeholder="Repeat password" value={pass2} onChange={e => setPass2(e.target.value)} onKeyDown={e => e.key === "Enter" && setup()} /></div>
           <button className="btn1" onClick={setup} disabled={saving} style={{ width: "100%", padding: 13, fontSize: 15, background: "#059669" }}>
+            {saving ? "Creating your account…" : "Create Account & Login 🚀"}
+          </button>
+        </>}
+
+        {studentInfo && accountType === "parent" && <>
+          <div style={{ background: "linear-gradient(135deg,#FDF4FF,#FAE8FF)", borderRadius: 12, padding: "14px 18px", marginBottom: 20, border: "2px solid #F0ABFC" }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "#A21CAF", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>🔑 Your Login Email</div>
+            <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 18, fontWeight: 800, color: "#0F172A" }}>{studentInfo.email}</div>
+            <div style={{ fontSize: 12, color: "#64748B", marginTop: 4 }}>You'll log in with this email + the password you set below.</div>
+          </div>
+
+          {error && <div className="err">{error}</div>}
+          <div style={{ marginBottom: 14 }}><label className="lbl">Set Your Password</label><input className="inp" type="password" placeholder="Minimum 6 characters" value={pass} onChange={e => setPass(e.target.value)} /></div>
+          <div style={{ marginBottom: 24 }}><label className="lbl">Confirm Password</label><input className="inp" type="password" placeholder="Repeat password" value={pass2} onChange={e => setPass2(e.target.value)} onKeyDown={e => e.key === "Enter" && setup()} /></div>
+          <button className="btn1" onClick={setup} disabled={saving} style={{ width: "100%", padding: 13, fontSize: 15, background: "#A21CAF" }}>
             {saving ? "Creating your account…" : "Create Account & Login 🚀"}
           </button>
         </>}
@@ -716,6 +859,24 @@ function AuthScreen({ onLogin }) {
     finally { setLoading(false); }
   };
 
+  const handleParent = async () => {
+    setLoading(true); setError("");
+    try {
+      const res = await sbSignIn(email, pass);
+      if (!res._ok) throw new Error(getAuthError(res));
+      if (!res.user?.id) throw new Error("Login failed — please try again.");
+      TOKEN = res.access_token;
+      const parentAccts = await db("parent_accounts", "GET", `auth_user_id=eq.${res.user.id}`);
+      if (!parentAccts?.length) {
+        await sbSignOut(); TOKEN = SB_KEY;
+        throw new Error("No parent account found for this login. Ask your child's teacher for an invite.");
+      }
+      const data = await loadParentData(res.user.id);
+      onLogin({ type: "parent", session: res, data });
+    } catch (e) { setError(e.message); }
+    finally { setLoading(false); }
+  };
+
 
 
   return (
@@ -723,18 +884,21 @@ function AuthScreen({ onLogin }) {
       <style>{CSS}</style>
       <div style={{ background: "#fff", borderRadius: 24, padding: 40, width: 440, maxWidth: "95vw", boxShadow: "0 24px 80px rgba(0,0,0,0.4)" }}>
         <div style={{ textAlign: "center", marginBottom: 28 }}>
-          <div style={{ width: 56, height: 56, background: "linear-gradient(135deg,#4F46E5,#7C3AED)", borderRadius: 16, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28, margin: "0 auto 12px" }}>🎓</div>
-          <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 26, fontWeight: 800, color: "#0F172A" }}>EduHive</div>
+          <div style={{ width: 56, height: 56, background: `linear-gradient(135deg,${BRAND.primaryColor},${BRAND.secondaryColor})`, borderRadius: 16, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28, margin: "0 auto 12px" }}>{BRAND.logoEmoji}</div>
+          <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 26, fontWeight: 800, color: "#0F172A" }}>{BRAND.name}</div>
           <div style={{ color: "#64748B", fontSize: 14, marginTop: 4 }}>Smart Tutoring Platform</div>
         </div>
 
-        {/* Top tabs: Teacher / Student */}
+        {/* Top tabs: Teacher / Student / Parent */}
         <div style={{ display: "flex", background: "#F1F5F9", borderRadius: 12, padding: 4, marginBottom: 24, gap: 4 }}>
-          <button onClick={() => { setTab("login"); setError(""); }} style={{ flex: 1, padding: "10px", borderRadius: 9, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 600, fontFamily: "inherit", background: tab === "login" || tab === "signup" ? "#fff" : "transparent", color: tab === "login" || tab === "signup" ? "#0F172A" : "#64748B", transition: "all 0.18s", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+          <button onClick={() => { setTab("login"); setError(""); }} style={{ flex: 1, padding: "10px", borderRadius: 9, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: tab === "login" || tab === "signup" ? "#fff" : "transparent", color: tab === "login" || tab === "signup" ? "#0F172A" : "#64748B", transition: "all 0.18s", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
             👩‍🏫 Teacher
           </button>
-          <button onClick={() => { setTab("student"); setError(""); }} style={{ flex: 1, padding: "10px", borderRadius: 9, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 600, fontFamily: "inherit", background: tab === "student" ? "#fff" : "transparent", color: tab === "student" ? "#0F172A" : "#64748B", transition: "all 0.18s", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+          <button onClick={() => { setTab("student"); setError(""); }} style={{ flex: 1, padding: "10px", borderRadius: 9, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: tab === "student" ? "#fff" : "transparent", color: tab === "student" ? "#0F172A" : "#64748B", transition: "all 0.18s", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
             👨‍🎓 Student
+          </button>
+          <button onClick={() => { setTab("parent"); setError(""); }} style={{ flex: 1, padding: "10px", borderRadius: 9, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: tab === "parent" ? "#fff" : "transparent", color: tab === "parent" ? "#0F172A" : "#64748B", transition: "all 0.18s", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+            👪 Parent
           </button>
         </div>
 
@@ -757,8 +921,27 @@ function AuthScreen({ onLogin }) {
           </button>
         </>}
 
+        {/* Parent Login */}
+        {tab === "parent" && <>
+          <div style={{ background: "#FDF4FF", borderRadius: 12, padding: "12px 16px", marginBottom: 20, fontSize: 13, color: "#86198F" }}>
+            Parents: use the email + password from your invite link. Ask your child's teacher if you haven't received one.
+          </div>
+          <div style={{ marginBottom: 14 }}>
+            <label className="lbl">Email</label>
+            <input className="inp" type="email" placeholder="you@example.com" value={email} onChange={e => setEmail(e.target.value)} autoComplete="email" />
+          </div>
+          <div style={{ marginBottom: 20 }}>
+            <label className="lbl">Password</label>
+            <input className="inp" type="password" placeholder="••••••••" value={pass} onChange={e => setPass(e.target.value)} onKeyDown={e => e.key === "Enter" && handleParent()} />
+          </div>
+          {error && <div className="err">{error}</div>}
+          <button className="btn1" onClick={handleParent} disabled={loading} style={{ width: "100%", padding: 13, fontSize: 15, background: "#A21CAF" }}>
+            {loading ? "Signing in…" : "Login as Parent"}
+          </button>
+        </>}
+
         {/* Teacher Login / Signup */}
-        {tab !== "student" && <>
+        {(tab === "login" || tab === "signup") && <>
           <div style={{ display: "flex", background: "#F8FAFF", borderRadius: 10, padding: 4, marginBottom: 20, gap: 4, border: "1px solid #E2E8F0" }}>
             {["login", "signup"].map(t => <button key={t} onClick={() => { setTab(t); setError(""); }} style={{ flex: 1, padding: "8px", borderRadius: 7, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "inherit", background: tab === t ? "#4F46E5" : "transparent", color: tab === t ? "#fff" : "#64748B", transition: "all 0.18s" }}>{t === "login" ? "Login" : "Sign Up"}</button>)}
           </div>
@@ -767,7 +950,7 @@ function AuthScreen({ onLogin }) {
           <div style={{ marginBottom: 20 }}><label className="lbl">Password</label><input className="inp" type="password" placeholder="••••••••" value={pass} onChange={e => setPass(e.target.value)} onKeyDown={e => e.key === "Enter" && handleTeacher()} /></div>
           {error && <div className="err">{error}</div>}
           <button className="btn1" onClick={handleTeacher} disabled={loading} style={{ width: "100%", padding: 13, fontSize: 15 }}>
-            {loading ? "Please wait…" : tab === "login" ? "Login to EduHive" : "Create Teacher Account"}
+            {loading ? "Please wait…" : tab === "login" ? `Login to ${BRAND.name}` : "Create Teacher Account"}
           </button>
         </>}
       </div>
@@ -801,6 +984,8 @@ export default function TutoringApp() {
         if (type === "student") {
           data = await loadStudentData(res.user.id);
           if (data.student.active === false) throw new Error("Account disabled");
+        } else if (type === "parent") {
+          data = await loadParentData(res.user.id);
         } else {
           const status = await getTeacherAccountStatus(res.user.id);
           if (status && status.active === false) throw new Error("Account disabled");
@@ -837,6 +1022,7 @@ export default function TutoringApp() {
   if (!appUser && inviteToken) return <InviteSetupScreen token={inviteToken} onLogin={handleLogin} />;
   if (!appUser) return <AuthScreen onLogin={handleLogin} />;
   if (appUser.type === "student") return <StudentApp initialData={appUser.data} session={appUser.session} onLogout={handleLogout} />;
+  if (appUser.type === "parent") return <ParentApp initialData={appUser.data} session={appUser.session} onLogout={handleLogout} />;
   return <TeacherApp initialData={appUser.data} session={appUser.session} onLogout={handleLogout} />;
 }
 
@@ -1038,6 +1224,153 @@ function ManageStudentsView({ allStudentsGlobal, allTeachers, allLinks, allAccou
   );
 }
 
+// ── Parent App ─────────────────────────────────────────────────────────────────
+function ParentQuestionBreakdown({ questions, getSelected }) {
+  return (
+    <div className="no-copy" onContextMenu={e => e.preventDefault()} style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+      {(questions || []).map((q, i) => {
+        const selected = getSelected(q);
+        const correct = selected?.toLowerCase() === q.correct_answer?.toLowerCase();
+        return (
+          <div key={q.id || i} style={{ padding: "10px 12px", background: correct ? "#F0FDF4" : "#FEF2F2", borderRadius: 8, fontSize: 13, border: `1px solid ${correct ? "#BBF7D0" : "#FECACA"}` }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+              <span>{correct ? "✅" : "❌"}</span>
+              <div style={{ flex: 1 }}>
+                <div style={{ color: "#0F172A", fontWeight: 500 }}><MathText text={q.question_text} /></div>
+                <div style={{ color: "#64748B", marginTop: 2, fontSize: 12 }}>
+                  Answered: <strong style={{ color: correct ? "#059669" : "#DC2626" }}>{selected || "(no answer)"}</strong>
+                  {!correct && <> · Correct: <strong style={{ color: "#059669" }}>{q.correct_answer}</strong></>}
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ParentApp({ initialData, session, onLogout }) {
+  const [data, setData] = useState(initialData);
+  const [loading, setLoading] = useState(false);
+  const [expanded, setExpanded] = useState(null); // assignment id whose breakdown is open
+  const [expandedRetake, setExpandedRetake] = useState(null);
+
+  const switchChild = async (studentId) => {
+    if (studentId === data.selectedStudentId) return;
+    setLoading(true); setExpanded(null); setExpandedRetake(null);
+    try { const d = await loadParentData(session.user.id, studentId); setData(d); }
+    catch (e) { console.error(e); }
+    finally { setLoading(false); }
+  };
+
+  const child = data.children.find(c => c.studentId === data.selectedStudentId);
+  const assignments = [...data.assignments].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+  return (
+    <div style={{ fontFamily: "'Inter','Outfit',sans-serif", minHeight: "100vh", background: "#F0F2F8" }}>
+      <style>{CSS}</style>
+      <div style={{ background: "linear-gradient(135deg,#0F172A,#1E1B4B)", padding: "16px 32px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ width: 36, height: 36, background: "linear-gradient(135deg,#A21CAF,#701A75)", borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>👪</div>
+          <div><div style={{ fontFamily: "Outfit,sans-serif", color: "#fff", fontWeight: 800, fontSize: 16 }}>{BRAND.name}</div><div style={{ color: "#475569", fontSize: 11 }}>Parent Portal</div></div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+          {data.children.length > 1 && (
+            <select className="sel" value={data.selectedStudentId} onChange={e => switchChild(e.target.value)} style={{ background: "rgba(255,255,255,0.1)", color: "#E2E8F0", border: "1px solid rgba(255,255,255,0.15)", fontSize: 12, padding: "6px 10px", width: "auto" }}>
+              {data.children.map(c => <option key={c.studentId} value={c.studentId} style={{ color: "#0F172A" }}>{c.name} — {c.teacherName}</option>)}
+            </select>
+          )}
+          <button onClick={onLogout} style={{ background: "rgba(239,68,68,0.15)", color: "#FCA5A5", border: "none", padding: "7px 14px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 600, fontFamily: "inherit" }}>Sign Out</button>
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 720, margin: "0 auto", padding: "32px 20px" }}>
+        {loading ? <Loader text="Loading…" /> : <>
+          <div style={{ marginBottom: 20 }}>
+            <div className="av" style={{ background: getAC(child?.studentId), width: 56, height: 56, fontSize: 20, display: "inline-flex", marginRight: 14, verticalAlign: "middle" }}>{child?.avatar || child?.name?.[0]}</div>
+            <span style={{ fontFamily: "Outfit,sans-serif", fontSize: 22, fontWeight: 800, color: "#0F172A" }}>{child?.name}</span>
+            <div style={{ color: "#64748B", fontSize: 13, marginTop: 4, marginLeft: 70 }}>{child?.grade} · Teacher: {child?.teacherName}</div>
+          </div>
+
+          <div style={{ fontWeight: 700, fontSize: 15, color: "#0F172A", marginBottom: 12 }}>Assignments</div>
+          {assignments.length === 0 && <div className="card" style={{ textAlign: "center", color: "#94A3B8", padding: 32 }}>No assignments yet.</div>}
+          {assignments.map(a => {
+            const sub = a.submission;
+            const status = sub?.status || "not_started";
+            const pct = sub?.percentage ?? 0;
+            const isOpen = expanded === a.id;
+            return (
+              <div key={a.id} className="card" style={{ marginBottom: 12, cursor: (sub && (status === "submitted" || status === "pending_review")) ? "pointer" : "default" }}
+                onClick={() => sub && (status === "submitted" || status === "pending_review") && setExpanded(isOpen ? null : a.id)}>
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 600, fontSize: 14, color: "#0F172A" }}>{a.title}</div>
+                    <div style={{ fontSize: 12, color: "#64748B", marginTop: 2 }}>{a.class?.name} · {a.subject}</div>
+                  </div>
+                  {status === "submitted" ? (
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 20, fontWeight: 800, color: pct >= 70 ? "#059669" : pct >= 50 ? "#D97706" : "#DC2626" }}>{pct}%</div>
+                      <div style={{ fontSize: 11, color: "#64748B" }}>{sub.score}/{sub.total_points} pts</div>
+                    </div>
+                  ) : status === "pending_review" ? (
+                    <span className="bdg" style={{ background: "#FEF3C7", color: "#D97706" }}>Under Review</span>
+                  ) : status === "in_progress" ? (
+                    <span className="bdg" style={{ background: "#FEF3C7", color: "#D97706" }}>In Progress</span>
+                  ) : (
+                    <span className="bdg" style={{ background: "#F1F5F9", color: "#64748B" }}>Not Started</span>
+                  )}
+                </div>
+
+                {isOpen && sub && (
+                  <div onClick={e => e.stopPropagation()}>
+                    {sub.teacher_feedback && (
+                      <div style={{ marginTop: 10, fontSize: 13, background: "#F8FAFF", borderRadius: 8, padding: "10px 12px", color: "#475569" }}>
+                        <strong>Teacher feedback:</strong> {sub.teacher_feedback}
+                      </div>
+                    )}
+                    {a.questions?.length > 0 && (
+                      <ParentQuestionBreakdown
+                        questions={a.questions}
+                        getSelected={q => a.studentAnswers.find(sa => sa.question_id === q.id)?.selected_answer}
+                      />
+                    )}
+                    {a.retakeSessions?.length > 0 && (
+                      <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+                        {a.retakeSessions.map(r => {
+                          const rOpen = expandedRetake === r.id;
+                          return (
+                            <div key={r.id}>
+                              <div
+                                style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, background: "#F8FAFF", borderRadius: 8, padding: "6px 10px", cursor: r.status === "submitted" ? "pointer" : "default" }}
+                                onClick={() => r.status === "submitted" && setExpandedRetake(rOpen ? null : r.id)}
+                              >
+                                <span style={{ fontWeight: 600, color: "#4F46E5" }}>Retake {r.attempt_number}</span>
+                                {r.status === "submitted" ? (
+                                  <>
+                                    <span style={{ fontWeight: 700, color: (r.percentage || 0) >= 70 ? "#059669" : (r.percentage || 0) >= 50 ? "#D97706" : "#DC2626" }}>{r.percentage}%</span>
+                                    <span style={{ color: "#64748B" }}>{r.score}/{r.total_points} pts</span>
+                                    <span style={{ color: "#4F46E5", marginLeft: "auto" }}>{rOpen ? "▲ Hide" : "▼ View answers"}</span>
+                                  </>
+                                ) : <span style={{ color: "#D97706", fontWeight: 600 }}>In progress…</span>}
+                              </div>
+                              {rOpen && <ParentQuestionBreakdown questions={r.questions} getSelected={q => (r.answers || {})[q.id]} />}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </>}
+      </div>
+    </div>
+  );
+}
+
 function TeacherApp({ initialData, session, onLogout }) {
   const [classes, setClasses] = useState(initialData.classes);
   const [students, setStudents] = useState(initialData.students);
@@ -1096,8 +1429,8 @@ function TeacherApp({ initialData, session, onLogout }) {
       <style>{CSS}</style>
       <div style={{ width: sidebar ? 240 : 72, background: "linear-gradient(180deg,#0F172A 0%,#1E1B4B 100%)", display: "flex", flexDirection: "column", padding: "20px 12px", transition: "width 0.25s", flexShrink: 0, overflow: "hidden" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 24, padding: "0 4px" }}>
-          <div style={{ width: 36, height: 36, background: "linear-gradient(135deg,#4F46E5,#7C3AED)", borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, fontSize: 18 }}>🎓</div>
-          {sidebar && <div><div style={{ fontFamily: "Outfit,sans-serif", color: "#fff", fontWeight: 800, fontSize: 16 }}>EduHive</div><div style={{ color: "#475569", fontSize: 10 }}>{isAdmin ? "Teacher + Admin Portal" : "Teacher Portal"}</div></div>}
+          <div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${BRAND.primaryColor},${BRAND.secondaryColor})`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, fontSize: 18 }}>{BRAND.logoEmoji}</div>
+          {sidebar && <div><div style={{ fontFamily: "Outfit,sans-serif", color: "#fff", fontWeight: 800, fontSize: 16 }}>{BRAND.name}</div><div style={{ color: "#475569", fontSize: 10 }}>{isAdmin ? "Teacher + Admin Portal" : "Teacher Portal"}</div></div>}
         </div>
         <nav style={{ flex: 1 }}>{navItems.map(n => <div key={n.id} className={`ni${view === n.id ? " on" : ""}`} onClick={() => setView(n.id)} title={n.label}><span style={{ fontSize: 18, flexShrink: 0 }}>{n.icon}</span>{sidebar && <span>{n.label}</span>}</div>)}</nav>
         {sidebar && <div style={{ marginTop: 16, padding: "8px 4px", borderTop: "1px solid #1E293B" }}><div style={{ color: "#475569", fontSize: 11, marginBottom: 4 }}>Signed in as</div><div style={{ color: "#94A3B8", fontSize: 11, marginBottom: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{user.name}</div><button onClick={onLogout} style={{ background: "rgba(239,68,68,0.15)", color: "#FCA5A5", border: "none", padding: "7px 12px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontWeight: 600, width: "100%", fontFamily: "inherit" }}>Sign Out</button></div>}
@@ -1124,6 +1457,7 @@ function TeacherApp({ initialData, session, onLogout }) {
         {modal === "viewClass" && <ViewClassModal cls={modalData.cls} students={students} assignments={assignments} close={closeModal} />}
         {modal === "assignStudents" && <AssignStudentsModal cls={modalData.cls} {...ctx} close={closeModal} />}
         {modal === "studentInvite" && <StudentInviteModal student={modalData.student} {...ctx} close={closeModal} />}
+        {modal === "parentInvite" && <ParentInviteModal student={modalData.student} {...ctx} close={closeModal} />}
         {modal === "assignmentResults" && <AssignmentResultsModal assignment={modalData.assignment} students={students} reload={reload} close={closeModal} />}
       </div></div>}
     </div>
@@ -1278,6 +1612,84 @@ function StudentInviteModal({ student, reload, close }) {
   );
 }
 
+function ParentInviteModal({ student, reload, close }) {
+  const [parentName, setParentName] = useState("");
+  const [email, setEmail] = useState(student.email || "");
+  const [token, setToken] = useState(null);
+  const [alreadyLinked, setAlreadyLinked] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [step, setStep] = useState("form"); // form | invite
+
+  const sendInvite = async () => {
+    if (!email.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) { setError("A valid email is required."); return; }
+    setLoading(true); setError("");
+    try {
+      // Same email = same parent identity — link rather than duplicate.
+      const existing = await db("parent_accounts", "GET", `email=eq.${email.trim().toLowerCase()}`);
+      let acct;
+      if (existing?.length) {
+        acct = existing[0];
+        const existingLink = await db("parent_student_links", "GET", `parent_account_id=eq.${acct.id}&student_id=eq.${student.id}`);
+        if (!existingLink?.length) {
+          await db("parent_student_links", "POST", "", { parent_account_id: acct.id, student_id: student.id });
+        }
+        setAlreadyLinked(true);
+      } else {
+        const [newAcct] = await db("parent_accounts", "POST", "", { email: email.trim().toLowerCase(), parent_name: parentName.trim() || null });
+        acct = newAcct;
+        await db("parent_student_links", "POST", "", { parent_account_id: acct.id, student_id: student.id });
+      }
+      setToken(acct.invite_token);
+      setStep("invite");
+      await reload();
+    } catch (e) { setError(e.message); }
+    finally { setLoading(false); }
+  };
+
+  const inviteLink = token ? `${window.location.origin}?invite=${token}` : null;
+  const [copied, setCopied] = useState(false);
+  const copy = () => { navigator.clipboard.writeText(inviteLink); setCopied(true); setTimeout(() => setCopied(false), 2000); };
+
+  if (step === "invite") {
+    return (
+      <div style={{ textAlign: "center" }}>
+        <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 22, fontWeight: 800, color: "#0F172A", marginBottom: 4 }}>Parent Invite</div>
+        <div style={{ color: "#64748B", fontSize: 14, marginBottom: 20 }}>Share this with {student.name}'s parent</div>
+        {alreadyLinked && (
+          <div style={{ background: "#FDF4FF", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: "#86198F", marginBottom: 16, textAlign: "left" }}>
+            This email already has a parent account — {student.name} was added to it. If they've already accepted their invite (e.g. for a sibling), they can just log in directly and will now see {student.name} in their child switcher — no new invite needed.
+          </div>
+        )}
+        <div style={{ background: "#F8FAFF", borderRadius: 12, padding: 16, marginBottom: 16, wordBreak: "break-all", fontSize: 13, color: "#4F46E5", border: "1.5px solid #E8EEFF" }}>{inviteLink}</div>
+        <button className="btn1" onClick={copy} style={{ width: "100%", marginBottom: 10, background: "#A21CAF" }}>{copied ? "✓ Copied!" : "Copy Invite Link"}</button>
+        <button className="btn2" onClick={close} style={{ width: "100%" }}>Close</button>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={{ fontFamily: "Outfit,sans-serif", fontSize: 22, fontWeight: 800, color: "#0F172A", marginBottom: 6 }}>Invite Parent</div>
+      <div style={{ color: "#64748B", fontSize: 13, marginBottom: 20 }}>Gives {student.name}'s parent read-only access to their assignments and grades.</div>
+      {error && <div className="err">{error}</div>}
+      <div style={{ marginBottom: 16 }}>
+        <label className="lbl">Parent Name <span style={{ color: "#94A3B8", fontWeight: 400, fontSize: 11, textTransform: "none" }}>(optional)</span></label>
+        <input className="inp" placeholder="e.g. Mrs. Arora" value={parentName} onChange={e => setParentName(e.target.value)} />
+      </div>
+      <div style={{ marginBottom: 20 }}>
+        <label className="lbl">Parent Email</label>
+        <input className="inp" type="email" placeholder="parent@example.com" value={email} onChange={e => setEmail(e.target.value)} />
+        <div style={{ fontSize: 11, color: "#94A3B8", marginTop: 4 }}>If this email already has a parent account (e.g. for a sibling), {student.name} will just be added to it — no duplicate login created.</div>
+      </div>
+      <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+        <button className="btn2" onClick={close}>Cancel</button>
+        <button className="btn1" onClick={sendInvite} disabled={loading} style={{ background: "#A21CAF" }}>{loading ? "Sending…" : "Generate Invite"}</button>
+      </div>
+    </div>
+  );
+}
+
 
 // ── Students View ─────────────────────────────────────────────────────────────
 function StudentsView({ students, classes, openModal, reload, userId }) {
@@ -1296,6 +1708,7 @@ function StudentsView({ students, classes, openModal, reload, userId }) {
           <div style={{ flex: 1 }}><div style={{ fontWeight: 600, color: "#0F172A", fontSize: 14 }}>{s.name}</div><div style={{ fontSize: 12, color: "#64748B" }}>{s.grade} · {s.email}</div></div>
           <div>{accepted ? <span style={{ fontSize: 12, color: "#059669", background: "#D1FAE5", padding: "3px 10px", borderRadius: 20, fontWeight: 600 }}>✓ Active</span> : hasAccount ? <span style={{ fontSize: 12, color: "#D97706", background: "#FEF3C7", padding: "3px 10px", borderRadius: 20, fontWeight: 600 }}>⏳ Invited</span> : <span style={{ fontSize: 12, color: "#94A3B8", background: "#F1F5F9", padding: "3px 10px", borderRadius: 20 }}>No invite</span>}</div>
           <button className="btng" onClick={() => openModal("studentInvite", { student: s })}>🔗 Invite</button>
+          <button className="btno" onClick={() => openModal("parentInvite", { student: s })}>👪 Parent</button>
           <button className="btnd" onClick={() => remove(s.id)}>Remove</button>
         </div>);
       })}
@@ -1519,7 +1932,7 @@ function AddStudentModal({ reload, userId, close }) {
       <div style={{ marginBottom: 16 }}>
         <label className="lbl">Username * <span style={{ color: "#94A3B8", fontWeight: 400, fontSize: 11, textTransform: "none" }}>(student uses this to log in)</span></label>
         <input className="inp" placeholder="e.g. arjun_singh" value={username} onChange={e => setUsername(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ""))} />
-        {username && <div style={{ fontSize: 11, color: "#64748B", marginTop: 4 }}>Student logs in at EduHive with: <strong>{username}</strong> + their password</div>}
+        {username && <div style={{ fontSize: 11, color: "#64748B", marginTop: 4 }}>Student logs in at {BRAND.name} with: <strong>{username}</strong> + their password</div>}
       </div>
       <div style={{ marginBottom: 16 }}>
         <label className="lbl">Contact Email * <span style={{ color: "#94A3B8", fontWeight: 400, fontSize: 11, textTransform: "none" }}>(used to detect an existing account)</span></label>
@@ -2763,7 +3176,7 @@ const [loadingTopics, setLoadingTopics] = useState(false);
   return (<div style={{ fontFamily: "'Inter','Outfit',sans-serif", minHeight: "100vh", background: "#F0F2F8" }}>
     <style>{CSS}</style>
     <div style={{ background: "linear-gradient(135deg,#0F172A,#1E1B4B)", padding: "16px 32px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 12 }}><div style={{ width: 36, height: 36, background: "linear-gradient(135deg,#4F46E5,#7C3AED)", borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>🎓</div><div><div style={{ fontFamily: "Outfit,sans-serif", color: "#fff", fontWeight: 800, fontSize: 16 }}>EduHive</div><div style={{ color: "#475569", fontSize: 11 }}>Student Portal</div></div></div>
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}><div style={{ width: 36, height: 36, background: `linear-gradient(135deg,${BRAND.primaryColor},${BRAND.secondaryColor})`, borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>{BRAND.logoEmoji}</div><div><div style={{ fontFamily: "Outfit,sans-serif", color: "#fff", fontWeight: 800, fontSize: 16 }}>{BRAND.name}</div><div style={{ color: "#475569", fontSize: 11 }}>Student Portal</div></div></div>
       <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
         {data.linkedProfiles && data.linkedProfiles.length > 1 && (
           <select
