@@ -576,6 +576,14 @@ const CSS = `
 @keyframes spin{to{transform:rotate(360deg)}}
 @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 .fade{animation:fadeIn 0.3s ease}
+.passage-layout{display:flex;flex-direction:column;gap:24px;margin-bottom:24px}
+.passage-panel{background:#F8FAFF;border-radius:14px;border:1px solid #E2E8F0;padding:20px 22px}
+.passage-questions{min-width:0}
+@media (min-width:820px){
+  .passage-layout{flex-direction:row;align-items:flex-start}
+  .passage-panel{flex:0 0 42%;position:sticky;top:20px;max-height:calc(100vh - 40px);overflow-y:auto}
+  .passage-questions{flex:1}
+}
 `;
 
 // ── FIX 1: Math Text Renderer ─────────────────────────────────────────────────
@@ -962,6 +970,7 @@ function AuthScreen({ onLogin }) {
 const SESSION_KEY = "eduhive_session";
 
 export default function TutoringApp() {
+ 
   const [inviteToken, setInviteToken] = useState(null);
   const [appUser, setAppUser] = useState(null);
   const [restoring, setRestoring] = useState(true);
@@ -3592,6 +3601,184 @@ function LibraryBrowser({ onAdd, close }) {
   );
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// ScreenedQuestionRunner — shared by AssignmentTaker, SelfTest, and GradeTest.
+// Takes an ordered question array, groups consecutive passage_id matches into
+// one screen, walks forward-only (no back nav), requires all answers on a
+// screen before advancing. Essay answers need a 20+ word minimum.
+// ══════════════════════════════════════════════════════════════════════════
+
+function buildScreens(questions) {
+  const screens = [];
+  let i = 0;
+  while (i < questions.length) {
+    const q = questions[i];
+    if (q.passage_id) {
+      const group = [q];
+      let j = i + 1;
+      while (j < questions.length && questions[j].passage_id === q.passage_id) {
+        group.push(questions[j]);
+        j++;
+      }
+      screens.push({ type: "passage", passageId: q.passage_id, questions: group });
+      i = j;
+    } else {
+      screens.push({ type: "single", questions: [q] });
+      i++;
+    }
+  }
+  return screens;
+}
+
+function wordCount(text) {
+  return (text || "").trim().split(/\s+/).filter(Boolean).length;
+}
+
+function isScreenComplete(screen, answers) {
+  return screen.questions.every(q => {
+    const a = answers[q.id];
+    if (q.question_type === "essay") return wordCount(a) >= 20;
+    return a !== undefined && a !== null && a !== "";
+  });
+}
+
+// questions: ordered array (with passage_id where applicable)
+// passagesById: { [passage_id]: { title, passage_text } } — caller pre-fetches these
+// onComplete(answers): called with the full { [question_id]: answer } map once
+//   the last screen is submitted
+function ScreenedQuestionRunner({ questions, passagesById = {}, initialAnswers = {}, onAnswer, onComplete }) {
+  const [screens] = useState(() => buildScreens(questions));
+  const [screenIndex, setScreenIndex] = useState(0);
+  const [answers, setAnswers] = useState(initialAnswers);
+
+  const screen = screens[screenIndex];
+  const isLastScreen = screenIndex === screens.length - 1;
+  const complete = isScreenComplete(screen, answers);
+
+  const setAnswer = (qId, value) => {
+    setAnswers(prev => ({ ...prev, [qId]: value }));
+    if (onAnswer) onAnswer(qId, value);
+  };
+
+  const advance = () => {
+    if (!complete) return;
+    if (isLastScreen) {
+      onComplete(answers);
+    } else {
+      setScreenIndex(i => i + 1);
+    }
+  };
+
+  const passage = screen.type === "passage" ? passagesById[screen.passageId] : null;
+
+  return (
+    <div style={{ maxWidth: passage ? 1100 : 720, margin: "0 auto", padding: "28px 20px" }}>
+      {/* Progress indicator */}
+      <div style={{ textAlign: "center", fontSize: 13, fontWeight: 600, color: "#64748B", marginBottom: 18 }}>
+        Screen {screenIndex + 1} of {screens.length}
+      </div>
+      <div style={{ height: 4, background: "#E2E8F0", borderRadius: 4, marginBottom: 28, overflow: "hidden" }}>
+        <div style={{ height: "100%", background: "#4F46E5", width: `${((screenIndex + 1) / screens.length) * 100}%`, transition: "width 0.3s" }} />
+      </div>
+
+      <div className={passage ? "passage-layout" : ""}>
+        {passage && (
+          <div className="passage-panel fade">
+            <div style={{ fontWeight: 700, fontSize: 15, color: "#0F172A", marginBottom: 10 }}>
+              📖 {passage.title}
+            </div>
+            <div style={{ fontSize: 14, lineHeight: 1.7, color: "#334155", whiteSpace: "pre-wrap" }}>
+              {passage.passage_text}
+            </div>
+          </div>
+        )}
+
+        <div className={passage ? "passage-questions" : ""}>
+          {screen.questions.map((q, i) => (
+            <QuestionCard
+              key={q.id}
+              q={q}
+              index={i}
+              value={answers[q.id]}
+              onChange={val => setAnswer(q.id, val)}
+            />
+          ))}
+        </div>
+      </div>
+
+      <div style={{ textAlign: "center", marginTop: 28 }}>
+        <button
+          className="btn1"
+          onClick={advance}
+          disabled={!complete}
+          style={{ padding: "14px 48px", fontSize: 16, opacity: complete ? 1 : 0.5, cursor: complete ? "pointer" : "not-allowed" }}
+        >
+          {isLastScreen ? "Submit" : "Next →"}
+        </button>
+        {!complete && (
+          <div style={{ fontSize: 12, color: "#94A3B8", marginTop: 8 }}>
+            {screen.questions.some(q => q.question_type === "essay")
+              ? "Answer all questions (essay responses need at least 20 words) to continue."
+              : "Answer all questions on this screen to continue."}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Individual question renderer — handles multiple_choice, true_false, essay
+function QuestionCard({ q, index, value, onChange }) {
+  const opts = q.question_type === "true_false" ? ["true", "false"] : (q.options || []);
+  const optLabels = q.question_type === "multiple_choice" ? ["A", "B", "C", "D"] : null;
+
+  return (
+    <div className="qcard fade" style={{ marginBottom: 20 }}>
+      <div style={{ display: "flex", gap: 10, alignItems: "flex-start", marginBottom: 14 }}>
+        <div style={{ width: 28, height: 28, borderRadius: "50%", background: "#4F46E5", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 12, flexShrink: 0 }}>
+          {index + 1}
+        </div>
+        <div style={{ fontWeight: 600, color: "#0F172A", fontSize: 15, lineHeight: 1.5 }}>
+          <MathText text={q.question_text} />
+        </div>
+      </div>
+
+      <div style={{ paddingLeft: 38 }}>
+        {q.question_type === "essay" ? (
+          <>
+            <textarea
+              value={value || ""}
+              onChange={e => onChange(e.target.value)}
+              rows={6}
+              placeholder="Write your response here…"
+              style={{ width: "100%", padding: 12, borderRadius: 10, border: "1px solid #E2E8F0", fontSize: 14, fontFamily: "inherit", resize: "vertical" }}
+            />
+            <div style={{ fontSize: 12, color: wordCount(value) >= 20 ? "#059669" : "#94A3B8", marginTop: 6 }}>
+              {wordCount(value)} / 20 words minimum
+            </div>
+          </>
+        ) : (
+          opts.map((opt, oi) => {
+            const label = optLabels ? optLabels[oi] : null;
+            const val = optLabels ? label : opt;
+            const isSelected = value === val;
+            return (
+              <div key={oi} className={`opt${isSelected ? " selected" : ""}`} onClick={() => onChange(val)}>
+                {label && (
+                  <span style={{ width: 26, height: 26, borderRadius: "50%", background: isSelected ? "#4F46E5" : "#E2E8F0", color: isSelected ? "#fff" : "#64748B", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 11, flexShrink: 0 }}>{label}</span>
+                )}
+                <span style={{ fontWeight: 500, fontSize: 14, color: "#0F172A", textTransform: "capitalize" }}>
+                  <MathText text={opt} />
+                </span>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
 function TopicPracticeModal({ grade, subject, topic, student, onClose }) {
   const [questions, setQuestions] = useState([]);
   const [attemptNumber, setAttemptNumber] = useState(1);
@@ -3852,6 +4039,7 @@ function QuizInterface({ assignment, student, session, onClose }) {
   const [submitted, setSubmitted] = useState(false);
   const [result, setResult] = useState(null);
   const [savingQ, setSavingQ] = useState(null);
+  const [passagesById, setPassagesById] = useState({});
   // Retake support: once a student is on a retake, questions come from the
   // shared question_library/topic system (same one TopicPracticeModal uses)
   // instead of the per-assignment "questions" table.
@@ -3886,6 +4074,13 @@ function QuizInterface({ assignment, student, session, onClose }) {
           // Resume it if unfinished, or show its result if it was submitted.
           setQuestions(rs.questions || []);
           setAnswers(rs.answers || {});
+          const rsPassageIds = [...new Set((rs.questions || []).filter(q => q.passage_id).map(q => q.passage_id))];
+          if (rsPassageIds.length > 0) {
+            const pRows = await db("passages", "GET", `id=in.(${rsPassageIds.join(",")})`);
+            const byId = {};
+            (pRows || []).forEach(p => { byId[p.id] = p; });
+            setPassagesById(byId);
+          }
           setRetakeMode(true);
           setRetakeAttempt(rs.attempt_number);
           if (rs.status === "submitted") {
@@ -3895,6 +4090,13 @@ function QuizInterface({ assignment, student, session, onClose }) {
         } else {
           const qs = await db("questions", "GET", `assignment_id=eq.${assignment.id}&order=order_index.asc`);
           setQuestions(qs || []);
+          const passageIds = [...new Set((qs || []).filter(q => q.passage_id).map(q => q.passage_id))];
+          if (passageIds.length > 0) {
+            const pRows = await db("passages", "GET", `id=in.(${passageIds.join(",")})`);
+            const byId = {};
+            (pRows || []).forEach(p => { byId[p.id] = p; });
+            setPassagesById(byId);
+          }
           // Restore saved answers
           const saved = assignment.savedAnswers || [];
           const ans = {};
@@ -4289,7 +4491,7 @@ function QuizInterface({ assignment, student, session, onClose }) {
         </div>
       )}
 
-      <div style={{ maxWidth: 720, margin: "0 auto", padding: "32px 20px" }}>
+      <div style={{ maxWidth: passagesById && Object.keys(passagesById).length > 0 ? 1100 : 720, margin: "0 auto", padding: "32px 20px" }}>
         {/* Score banner after submission (auto-graded) or Under Review / Graded banner (teacher-graded) */}
         {needsUpload ? (submitted && renderUploadAndSubmit()) : (submitted && result && (
           <div className="fade" style={{ background: result.percentage >= 70 ? "linear-gradient(135deg,#059669,#047857)" : result.percentage >= 50 ? "linear-gradient(135deg,#D97706,#B45309)" : "linear-gradient(135deg,#DC2626,#B91C1C)", borderRadius: 20, padding: 32, marginBottom: 32, textAlign: "center", color: "#fff" }}>
@@ -4369,6 +4571,19 @@ function QuizInterface({ assignment, student, session, onClose }) {
         )}
 
         {/* Questions */}
+        {/* Taking mode: screened runner (passage grouping, forward-only, essay support) */}
+        {!submitted && !needsUpload && (
+          <ScreenedQuestionRunner
+            questions={questions}
+            passagesById={passagesById}
+            initialAnswers={answers}
+            onAnswer={(qId, val) => selectAnswer(qId, val)}
+            onComplete={() => submit()}
+          />
+        )}
+
+        {/* Review mode (after submit) and upload-required mode: original list view */}
+        {(submitted || needsUpload) && (
         <div className="no-copy" onContextMenu={e => e.preventDefault()} onCopy={e => e.preventDefault()}>
         {questions.map((q, i) => {
           const selected = answers[q.id];
@@ -4420,23 +4635,14 @@ function QuizInterface({ assignment, student, session, onClose }) {
               </div>
             </div>
           );
-        })}
+       })}
         </div>
+        )}
+
+        {/* Submit / Back buttons */}
 
         {/* Submit / Back buttons */}
         {!submitted && needsUpload && renderUploadAndSubmit()}
-        {!submitted && !needsUpload && (
-          <div style={{ textAlign: "center", marginTop: 24 }}>
-            <button className="btn1" onClick={submit} disabled={submitting || answered === 0} style={{ padding: "14px 48px", fontSize: 16 }}>
-              {submitting ? "Grading your answers…" : `Submit Assignment (${answered}/${questions.length} answered)`}
-            </button>
-            {answered < questions.length && (
-              <div style={{ fontSize: 12, color: "#94A3B8", marginTop: 8 }}>
-                Unanswered questions will be marked as incorrect.
-              </div>
-            )}
-          </div>
-        )}
         {submitted && (
           <div style={{ textAlign: "center", marginTop: 24 }}>
             <div style={{ display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap" }}>
